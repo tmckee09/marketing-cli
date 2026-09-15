@@ -19,7 +19,7 @@ jobs:
       - name: Clone upstream
         run: git clone --depth 1 https://github.com/MoizIbnYousaf/marketing-cli.git /tmp/upstream
       - name: Replace destination working tree with upstream snapshot
-        run: rsync -a --delete --exclude='.git' /tmp/upstream/ ./
+        run: rsync -a --delete --exclude='.git' --exclude='.github/workflows/' /tmp/upstream/ ./
       - name: Commit imported snapshot
         run: |
           git config user.name "github-actions[bot]"
