@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Amp supervises the services declared in .amp/services.yaml across pause/resume.
+printf '[%s] marketing-cli orb ready\n' "$(date -u +%H:%M:%S)"

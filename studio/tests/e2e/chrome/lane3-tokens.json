@@ -1,0 +1,15 @@
+{
+  "background": "rgb(245, 245, 245)",
+  "background95": "oklab(0.970145 0.0000441968 0.0000194311 / 0.95)",
+  "card95": "oklab(0.999994 0.0000455678 0.0000200868 / 0.95)",
+  "foreground": "rgb(12, 10, 9)",
+  "mutedFg": "rgb(119, 113, 105)",
+  "sidebarFg": "rgb(41, 37, 36)",
+  "border": "rgb(231, 229, 228)",
+  "sidebarBorder": "rgb(231, 229, 228)",
+  "sidebar": "rgb(250, 250, 250)",
+  "surface1": "rgb(255, 255, 255)",
+  "surface3": "rgb(240, 239, 237)",
+  "popover": "rgb(255, 255, 255)",
+  "popoverFg": "rgb(12, 10, 9)"
+}

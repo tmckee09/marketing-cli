@@ -1,0 +1,171 @@
+{
+  "funnel": {
+    "nodes": [
+      {
+        "key": "signals",
+        "label": "Signals",
+        "series": [
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          1
+        ],
+        "total": 1,
+        "deltaPct": null
+      },
+      {
+        "key": "briefs",
+        "label": "Briefs",
+        "series": [
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          1
+        ],
+        "total": 1,
+        "deltaPct": null
+      },
+      {
+        "key": "drafts",
+        "label": "Drafts",
+        "series": [
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          1
+        ],
+        "total": 1,
+        "deltaPct": null
+      },
+      {
+        "key": "publishes",
+        "label": "Publishes",
+        "series": [
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          1
+        ],
+        "total": 1,
+        "deltaPct": null
+      }
+    ],
+    "windowEnd": "2026-08-16T02:18:08.071Z"
+  },
+  "brandHealth": {
+    "score": 100,
+    "files": [
+      {
+        "name": "voice-profile.md",
+        "path": "brand/voice-profile.md",
+        "bytes": 50,
+        "mtime": "2026-08-16T02:18:07.931Z",
+        "freshness": "fresh"
+      },
+      {
+        "name": "positioning.md",
+        "path": "brand/positioning.md",
+        "bytes": 26,
+        "mtime": "2026-08-16T02:18:07.931Z",
+        "freshness": "fresh"
+      },
+      {
+        "name": "audience.md",
+        "path": "brand/audience.md",
+        "bytes": 52,
+        "mtime": "2026-08-16T02:18:07.931Z",
+        "freshness": "fresh"
+      },
+      {
+        "name": "competitors.md",
+        "path": "brand/competitors.md",
+        "bytes": 26,
+        "mtime": "2026-08-16T02:18:07.931Z",
+        "freshness": "fresh"
+      },
+      {
+        "name": "landscape.md",
+        "path": "brand/landscape.md",
+        "bytes": 42,
+        "mtime": "2026-08-16T02:18:07.931Z",
+        "freshness": "fresh"
+      },
+      {
+        "name": "keyword-plan.md",
+        "path": "brand/keyword-plan.md",
+        "bytes": 27,
+        "mtime": "2026-08-16T02:18:07.931Z",
+        "freshness": "fresh"
+      },
+      {
+        "name": "creative-kit.md",
+        "path": "brand/creative-kit.md",
+        "bytes": 27,
+        "mtime": "2026-08-16T02:18:07.931Z",
+        "freshness": "fresh"
+      },
+      {
+        "name": "stack.md",
+        "path": "brand/stack.md",
+        "bytes": 20,
+        "mtime": "2026-08-16T02:18:07.931Z",
+        "freshness": "fresh"
+      },
+      {
+        "name": "assets.md",
+        "path": "brand/assets.md",
+        "bytes": 10,
+        "mtime": "2026-08-16T02:18:07.931Z",
+        "freshness": "fresh"
+      },
+      {
+        "name": "learnings.md",
+        "path": "brand/learnings.md",
+        "bytes": 13,
+        "mtime": "2026-08-16T02:18:07.932Z",
+        "freshness": "fresh"
+      }
+    ],
+    "readyCount": 10,
+    "totalSlots": 10
+  },
+  "actions": [
+    {
+      "id": "system-calm",
+      "title": "Nothing flagged today.",
+      "detail": "When /cmo finds something worth your attention, it lands here.",
+      "href": "/dashboard?tab=signals",
+      "icon": "CheckCircle2",
+      "tone": "green"
+    }
+  ],
+  "activity": [],
+  "recentMedia": [],
+  "recentPublish": [
+    {
+      "id": 28,
+      "adapter": "mktg-native",
+      "providers": [
+        "x"
+      ],
+      "contentPreview": "snap-e2e publish",
+      "itemsPublished": 1,
+      "itemsFailed": 0,
+      "createdAt": "2026-08-16 11:18:08"
+    }
+  ],
+  "generatedAt": "2026-08-16T02:18:08.072Z",
+  "staleSections": []
+}

@@ -1,0 +1,49 @@
+{
+  "version": 1,
+  "catalogs": {
+    "postiz": {
+      "name": "postiz",
+      "repo_url": "https://github.com/gitroomhq/postiz-app",
+      "docs_url": "https://docs.postiz.com",
+      "license": "AGPL-3.0",
+      "version_pinned": "v2.21.6",
+      "capabilities": {
+        "publish_adapters": ["postiz"]
+      },
+      "transport": "http",
+      "sdk_reference": null,
+      "auth": {
+        "style": "bearer",
+        "base_env": "POSTIZ_API_BASE",
+        "credential_envs": ["POSTIZ_API_KEY"],
+        "header_format": "bare",
+        "base_default": "https://api.postiz.com"
+      },
+      "skills": ["postiz"]
+    },
+    "openseo": {
+      "name": "openseo",
+      "repo_url": "https://github.com/every-app/open-seo",
+      "docs_url": "https://openseo.so/docs/mcp",
+      "license": "MIT",
+      "version_pinned": "v0.1.6",
+      "capabilities": {
+        "research_adapters": ["openseo"]
+      },
+      "transport": "http",
+      "sdk_reference": null,
+      "auth": {
+        "style": "bearer",
+        "base_env": "OPENSEO_MCP_URL",
+        "credential_envs": ["OPENSEO_API_KEY"],
+        "header_format": "bearer",
+        "base_default": "https://app.openseo.so/mcp"
+      },
+      "skills": ["openseo", "openseo-coach", "openseo-competitive-landscape", "openseo-competitor-analysis", "openseo-keyword-clustering", "openseo-keyword-research", "openseo-link-prospecting", "openseo-project-setup"],
+      "mcp": {
+        "url_env": "OPENSEO_MCP_URL",
+        "default_url": "https://app.openseo.so/mcp"
+      }
+    }
+  }
+}

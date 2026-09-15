@@ -1,0 +1,1918 @@
+// server.ts — mktg-studio local backend
+//
+// Bun.serve entry point. Bridges:
+//   Next.js dashboard ← SSE → Bun server → mktg CLI / /cmo / SQLite
+//
+// Port: STUDIO_PORT env var (default 3001)
+// CORS: localhost:3000 (Next.js dev server)
+//
+// Agent DX contract (21/21):
+//   - Every route returns typed JSON or SSE
+//   - Every POST validates input with zod
+//   - ?dryRun=true supported on all mutating endpoints
+//   - /api/schema for runtime self-discovery
+//   - Input hardened via lib/validators.ts
+
+// Side-effect import: installs `uncaughtException` + `unhandledRejection`
+// handlers so silent Bun exits become visible stack traces (T31).
+// Must be the first import — installs handlers before anything else can throw.
+import "./lib/crash-handlers.ts";
+
+import { z } from "zod";
+import { getDb, closeDb, queryAll, execute } from "./lib/sqlite.ts";
+import { globalEmitter, getJobEmitter } from "./lib/sse.ts";
+import { startBrandWatcher, startContentWatcher, stopBrandWatcher, stopContentWatcher } from "./lib/watcher.ts";
+import { startZombieSweeper } from "./lib/sweep.ts";
+import { backupBrandDir, resetBrandDir } from "./lib/brand-backup.ts";
+import { childProcessEnv } from "./lib/child-env.ts";
+import { resolveMktgCommand } from "./lib/mktg-command.ts";
+import { createJob, runJob, getJob, listJobs } from "./lib/jobs.ts";
+import {
+  rejectControlChars,
+  validateResourceId,
+  validatePathInput,
+  parseJsonInput,
+} from "./lib/validators.ts";
+import {
+  checkAuth,
+  getOrCreateStudioToken,
+  studioTokenPath,
+  studioSessionCookie,
+  authIsDisabled,
+} from "./lib/auth.ts";
+import { basename, join } from "node:path";
+import { chmodSync, existsSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
+import {
+  mktgList,
+  mktgSkillInfo,
+  mktgCatalogList,
+  mktgCatalogStatus,
+  mktgSeoStatus,
+  mktgCatalogInfo,
+  mktgStatus,
+} from "./lib/mktg.ts";
+import { buildPulseSnapshot } from "./lib/pulse-snapshot.ts";
+import {
+  errEnv,
+  applyFieldsFromUrl,
+  ndjsonResponse,
+  wantsNDJSON,
+  type StudioErrorCode,
+} from "./lib/output.ts";
+import { wrapRoute, checkRateLimit } from "./lib/dx.ts";
+import {
+  startFoundation,
+  FOUNDATION_LANES,
+} from "./lib/foundation.ts";
+import {
+  registerRouteSchema,
+  enrichRouteSchema,
+  enrichRouteEntry,
+} from "./lib/schema-export.ts";
+import { resolveProjectPath, resolveProjectRoot, resolveStudioDbPath } from "./lib/project-root.ts";
+import { contentMimeType } from "./lib/content-manifest.ts";
+import {
+  BRAND_NOTE_BODY,
+  BRAND_RESET_BODY,
+  HIGHLIGHT_BODY,
+  INIT_BODY,
+  OPPORTUNITIES_PUSH_BODY,
+  SETTINGS_ENV_BODY,
+  SKILL_RUN_BODY,
+  TOAST_BODY,
+} from "./lib/schemas.ts";
+import { type RouteHttpHelpers, mapMktgErrorCode } from "./server/http.ts";
+import {
+  ACTIVITY_LIST_ROUTE,
+  ACTIVITY_LOG_BODY,
+  ACTIVITY_LOG_ROUTE,
+  ACTIVITY_DELETE_ROUTE,
+} from "./server/routes/activity.ts";
+import {
+  BRAND_WRITE_BODY,
+  BRAND_REGENERATE_BODY,
+  BRAND_FILES_ROUTE,
+  BRAND_READ_ROUTE,
+  BRAND_WRITE_ROUTE,
+  BRAND_REGENERATE_ROUTE,
+} from "./server/routes/brand.ts";
+import {
+  EMPTY_LIST_ROUTE,
+  TRENDS_HOT_CONTEXT_ROUTE,
+  SIGNALS_LIST_ROUTE,
+  SIGNALS_BASELINE_ROUTE,
+  SIGNAL_ID_BODY,
+  SIGNAL_DISMISS_ROUTE,
+  SIGNAL_APPROVE_ROUTE,
+  SIGNAL_FLAG_BODY,
+  SIGNAL_FLAG_ROUTE,
+  normalizeSignalRow,
+} from "./server/routes/signals.ts";
+import {
+  tryContentRoutes,
+  serveProjectAsset,
+  CONTENT_FILE_WRITE_BODY,
+  CONTENT_META_PATCH_BODY,
+  CONTENT_REINDEX_BODY,
+} from "./server/routes/content.ts";
+import {
+  tryPublishRoutes,
+  PUBLISH_BODY,
+  PUBLISH_NATIVE_PROVIDER_BODY,
+} from "./server/routes/publish.ts";
+import { createPlanCompeteRoutes } from "./server/routes/plan.ts";
+
+// ---------------------------------------------------------------------------
+// Config
+// ---------------------------------------------------------------------------
+
+const PORT = parseInt(process.env.STUDIO_PORT ?? "3001", 10);
+const STUDIO_CWD = resolveProjectRoot(process.cwd());
+const { PLAN_ROUTE, PLAN_NEXT_ROUTE, COMPETE_LIST_ROUTE, COMPETE_SCAN_ROUTE } =
+  createPlanCompeteRoutes(STUDIO_CWD);
+
+const readEnvFile = (root: string): Record<string, string> => {
+  const envPath = join(root, ".env.local");
+  if (!existsSync(envPath)) return {};
+  const env: Record<string, string> = {};
+  for (const raw of readFileSync(envPath, "utf-8").split("\n")) {
+    const line = raw.trim();
+    if (!line || line.startsWith("#")) continue;
+    const eq = line.indexOf("=");
+    if (eq < 0) continue;
+    const key = line.slice(0, eq).trim();
+    let value = line.slice(eq + 1).trim();
+    if (
+      (value.startsWith('"') && value.endsWith('"')) ||
+      (value.startsWith("'") && value.endsWith("'"))
+    ) {
+      value = value.slice(1, -1);
+    }
+    env[key] = value;
+  }
+  return env;
+};
+
+const applyProjectEnvIsolation = (): void => {
+  const repoRoot = process.cwd();
+  const repoEnv = readEnvFile(repoRoot);
+  const projectEnv = readEnvFile(STUDIO_CWD);
+  if (STUDIO_CWD !== repoRoot) {
+    for (const [key, value] of Object.entries(repoEnv)) {
+      if (projectEnv[key] === undefined && process.env[key] === value) {
+        delete process.env[key];
+      }
+    }
+  }
+  for (const [key, value] of Object.entries(projectEnv)) {
+    process.env[key] = value;
+  }
+};
+
+applyProjectEnvIsolation();
+
+// Studio auth perimeter v1 (Lane 1, Wave A). Generate or load the token
+// before we accept any requests so the very first inbound has a token to
+// compare against. The token PATH is gated behind MKTG_STUDIO_DEBUG=1 to
+// match cabinet's invisible-token UX: default boot does not surface where
+// the token lives. The token VALUE is never printed.
+const STUDIO_TOKEN = getOrCreateStudioToken();
+if (process.env.MKTG_STUDIO_DEBUG === "1") {
+  console.log(`auth token: ${studioTokenPath()}`);
+}
+if (authIsDisabled()) {
+  console.warn(
+    "WARNING: MKTG_STUDIO_AUTH=disabled — every endpoint is open. Test/dev only.",
+  );
+}
+
+// Origins allowed to make cross-origin requests (CORS + EventSource). The
+// dev dashboard runs on :3000; Playwright's scratch dashboard on :4800. Add
+// new entries here when integrating a fresh frontend host.
+const ALLOWED_ORIGINS = new Set([
+  "http://localhost:3000",
+  "http://127.0.0.1:3000",
+  "http://localhost:4840",
+  "http://127.0.0.1:4840",
+  "http://localhost:4800",
+  "http://127.0.0.1:4800",
+]);
+
+// ---------------------------------------------------------------------------
+// Bootstrap
+// ---------------------------------------------------------------------------
+
+console.log("Initializing database...");
+getDb();
+console.log("Database ready.");
+
+startBrandWatcher(globalEmitter);
+startContentWatcher(globalEmitter, STUDIO_CWD);
+
+// Zombie-run sweeper — every 60s, flip skill_runs rows stuck in 'running'
+// for >5 minutes to 'abandoned' and broadcast `skill-abandoned` over SSE so
+// dashboards can unstick the activity panel spinner. Covers the /cmo-crash
+// / Claude-Code-reload scenario where the skill wrapper's cleanup never
+// ran (A14 / H1-33 / H1-90). /cmo emits its own 'skill-complete abandoned'
+// on graceful-interrupt paths; this is the safety net.
+startZombieSweeper(getDb(), (rows) => {
+  for (const r of rows) {
+    globalEmitter.publish("*", {
+      type: "skill-abandoned",
+      payload: { id: r.id, skill: r.skill, createdAt: r.createdAt, ageMs: r.ageMs },
+    });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+function cors(req: Request): Record<string, string> {
+  const origin = req.headers.get("origin") ?? "";
+  return ALLOWED_ORIGINS.has(origin)
+    ? {
+        "Access-Control-Allow-Origin": origin,
+        Vary: "Origin",
+        "Access-Control-Allow-Methods": "GET, POST, PUT, PATCH, DELETE, OPTIONS",
+        "Access-Control-Allow-Headers": "Content-Type",
+      }
+    : {};
+}
+
+function json(data: unknown, status = 200, extraHeaders: Record<string, string> = {}): Response {
+  return new Response(JSON.stringify(data), {
+    status,
+    headers: {
+      "Content-Type": "application/json",
+      "Cache-Control": "no-store",
+      "X-Content-Type-Options": "nosniff",
+      ...extraHeaders,
+    },
+  });
+}
+
+const PROJECT_LOGO_CANDIDATES = [
+  "brand/logo.png",
+  "brand/logo.jpg",
+  "brand/logo.jpeg",
+  "brand/logo.webp",
+  "brand/logo.svg",
+  "brand/assets/logo.png",
+  "brand/assets/logo.jpg",
+  "brand/assets/logo.jpeg",
+  "brand/assets/logo.webp",
+  "brand/assets/logo.svg",
+  "public/logo.png",
+  "public/logo.jpg",
+  "public/logo.jpeg",
+  "public/logo.webp",
+  "public/logo.svg",
+  "public/favicon.ico",
+  "public/favicon.png",
+  "public/icon.png",
+  "app/favicon.ico",
+  "app/icon.png",
+  "src/app/favicon.ico",
+  "src/app/icon.png",
+  "favicon.ico",
+];
+
+function projectInitials(name: string): string {
+  const parts = name
+    .replace(/[_-]+/g, " ")
+    .split(/\s+/)
+    .map((part) => part.trim())
+    .filter(Boolean);
+  if (parts.length === 0) return "MK";
+  if (parts.length === 1) return parts[0]!.slice(0, 2).toUpperCase();
+  return `${parts[0]![0] ?? "M"}${parts[1]![0] ?? "K"}`.toUpperCase();
+}
+
+function rootLabel(root: string): string {
+  return basename(root) || root;
+}
+
+function discoverProjectLogo(projectName: string):
+  | { kind: "image"; path: string; url: string; contentType: string }
+  | { kind: "initials"; initials: string } {
+  for (const candidate of PROJECT_LOGO_CANDIDATES) {
+    const resolved = resolveProjectPath(candidate, STUDIO_CWD);
+    if (!resolved.ok) continue;
+    try {
+      if (!existsSync(resolved.abs) || !statSync(resolved.abs).isFile()) continue;
+      return {
+        kind: "image",
+        path: resolved.rel,
+        url: `/api/assets/file?path=${encodeURIComponent(resolved.rel)}`,
+        contentType: contentMimeType(resolved.abs),
+      };
+    } catch {
+      continue;
+    }
+  }
+  return { kind: "initials", initials: projectInitials(projectName) };
+}
+
+function countNativePublishState(root: string): { configured: boolean; providerCount: number; postCount: number } {
+  const readArrayCount = (path: string, key: "providers" | "posts"): number => {
+    if (!existsSync(path)) return 0;
+    try {
+      const parsed = JSON.parse(readFileSync(path, "utf-8")) as Record<string, unknown>;
+      const value = parsed[key];
+      return Array.isArray(value) ? value.length : 0;
+    } catch {
+      return 0;
+    }
+  };
+
+  const accountPath = join(root, ".mktg", "native-publish", "account.json");
+  const providersPath = join(root, ".mktg", "native-publish", "providers.json");
+  const postsPath = join(root, ".mktg", "native-publish", "posts.json");
+
+  return {
+    configured: existsSync(accountPath),
+    providerCount: readArrayCount(providersPath, "providers"),
+    postCount: readArrayCount(postsPath, "posts"),
+  };
+}
+
+/**
+ * Build a structured error response (axis 7).
+ * The wire shape is `{ok:false, error:{code, message, fix?}}`.
+ *
+ * `code` is required and must be one of the `StudioErrorCode` enum values so
+ * agents can branch on the failure mode without parsing prose. `fix` is a
+ * single-line, agent-actionable hint for recovery.
+ *
+ * Most call sites use the lowercase `err()` shorthand which defaults to
+ * `BAD_INPUT` at HTTP 400.
+ */
+function errResponse(
+  code: StudioErrorCode,
+  message: string,
+  status: number,
+  fix?: string,
+  extraHeaders: Record<string, string> = {},
+): Response {
+  return json(errEnv(code, message, fix), status, extraHeaders);
+}
+
+function err(
+  message: string,
+  status = 400,
+  extraHeaders: Record<string, string> = {},
+  fix?: string,
+): Response {
+  const code: StudioErrorCode =
+    status === 401 ? "UNAUTHORIZED" :
+    status === 404 ? "NOT_FOUND" :
+    status === 429 ? "RATE_LIMITED" :
+    status >= 500 ? "INTERNAL" :
+    "BAD_INPUT";
+  return errResponse(code, message, status, fix, extraHeaders);
+}
+
+async function parseBody<T>(req: Request, schema: z.ZodSchema<T>): Promise<{ ok: true; data: T } | { ok: false; res: Response }> {
+  let raw: string;
+  try {
+    raw = await req.text();
+  } catch {
+    return {
+      ok: false,
+      res: errResponse(
+        "BAD_INPUT",
+        "Failed to read request body",
+        400,
+        "Send a UTF-8 JSON object as the request body",
+      ),
+    };
+  }
+
+  // Lane 1 / Wave A: route through parseJsonInput so inline-handled routes
+  // get the same 64 KB cap and `__proto__`/`constructor` proto-pollution
+  // guard as wrapRoute (lib/dx.ts::parseBodyStrict). The two paths used to
+  // diverge -- inline routes (~12 sites) silently accepted 10 MB JSON and
+  // proto-pollution payloads. They no longer do.
+  const parsed = parseJsonInput<unknown>(raw);
+  if (!parsed.ok) {
+    const status = parsed.message.includes("64KB") ? 413 : 400;
+    return {
+      ok: false,
+      res: errResponse(
+        "BAD_INPUT",
+        parsed.message,
+        status,
+        parsed.message.includes("Unsafe")
+          ? "Remove __proto__ or constructor keys from the payload"
+          : parsed.message.includes("64KB")
+            ? "Keep the JSON body under 64 KB"
+            : "Send a valid JSON object as the request body",
+      ),
+    };
+  }
+
+  // Promote ZodObject schemas to strict mode so unknown fields are rejected
+  // at the wire instead of silently stripped (audit P2-A, mirrors
+  // lib/dx.ts::parseBodyStrict). Keeps the runtime in sync with the
+  // `additionalProperties: false` that GET /api/schema advertises.
+  const maybeStrict = schema as unknown as { strict?: () => z.ZodSchema<T> };
+  const strictSchema =
+    typeof maybeStrict.strict === "function" ? maybeStrict.strict() : schema;
+  const check = strictSchema.safeParse(parsed.data);
+  if (!check.success) {
+    const issues = check.error.issues;
+    const message = issues.map((e) => e.message).join("; ");
+    const fields = issues
+      .map((e) => (e.path.length > 0 ? e.path.join(".") : "(root)"))
+      .filter((p, i, arr) => arr.indexOf(p) === i)
+      .join(", ");
+    return {
+      ok: false,
+      res: errResponse(
+        "BAD_INPUT",
+        message,
+        400,
+        fields ? `Check field(s): ${fields}` : "Check the request body shape",
+      ),
+    };
+  }
+  return { ok: true, data: check.data };
+}
+
+function isDryRun(url: URL): boolean {
+  return url.searchParams.get("dryRun") === "true";
+}
+
+/**
+ * Respond to a list-style GET with field-mask + NDJSON support (axis 4).
+ *
+ * - `Accept: application/x-ndjson` → newline-delimited JSON, one item per line
+ * - `?fields=a,b.c` → server-side projection; unknown fields return BAD_INPUT
+ *   listing what is available
+ * - default → standard `{ok:true, data:[...]}` envelope
+ *
+ * The field mask runs before NDJSON serialization so both transports project
+ * the same shape.
+ */
+function respondList<T>(
+  req: Request,
+  url: URL,
+  items: readonly T[],
+  corsHeaders: Record<string, string>,
+): Response {
+  const filtered = applyFieldsFromUrl(items, url);
+  if (!filtered.ok) {
+    return json({ ok: false, error: filtered.error }, filtered.status, corsHeaders);
+  }
+  const projected = filtered.data;
+
+  if (wantsNDJSON(req)) {
+    const arr = Array.isArray(projected) ? projected : [projected];
+    return ndjsonResponse(arr, corsHeaders);
+  }
+
+  return json({ ok: true, data: projected }, 200, corsHeaders);
+}
+
+/**
+ * Respond to a single-object GET with field-mask support (axis 4).
+ * NDJSON doesn't apply for single-object responses.
+ */
+function respondObject<T>(
+  url: URL,
+  data: T,
+  corsHeaders: Record<string, string>,
+  extras: Record<string, unknown> = {},
+): Response {
+  const filtered = applyFieldsFromUrl(data, url);
+  if (!filtered.ok) {
+    return json({ ok: false, error: filtered.error }, filtered.status, corsHeaders);
+  }
+  return json({ ok: true, data: filtered.data, ...extras }, 200, corsHeaders);
+}
+
+function respondMktgError(
+  result: { error: { code: string; message: string; suggestions: readonly string[] } },
+  corsHeaders: Record<string, string>,
+): Response {
+  const { code, status } = mapMktgErrorCode(result.error.code);
+  const fix = result.error.suggestions?.[0] ?? undefined;
+  return errResponse(code, result.error.message, status, fix, corsHeaders);
+}
+
+/** Shared HTTP helpers injected into extracted content/publish route modules. */
+const routeHttp: RouteHttpHelpers = {
+  json,
+  err,
+  errResponse,
+  parseBody,
+  isDryRun,
+  respondList,
+  respondObject,
+  respondMktgError,
+};
+
+// ---------------------------------------------------------------------------
+// Route schema (for /api/schema — Agent DX axis 3)
+// ---------------------------------------------------------------------------
+
+const ROUTE_SCHEMA = [
+  // Health + meta
+  { method: "GET",  path: "/api/health",                  description: "Server health check" },
+  { method: "GET",  path: "/api/project/current",         description: "Active local marketing project identity, launch context, and health" },
+  { method: "GET",  path: "/api/schema",                  description: "Runtime route schema for agent self-discovery", params: ["route"] },
+  { method: "GET",  path: "/api/help",                    description: "Agent cheat-sheet: envelopes, error codes, query params, entry points" },
+  { method: "GET",  path: "/api/auth/bootstrap",           description: "Localhost-only browser bootstrap. Establishes an HttpOnly, same-site Studio session without exposing the bearer token to JavaScript.", errors: [] },
+
+  // HQ legacy signal endpoints
+  { method: "GET",  path: "/api/pulse/decision-feed",     description: "Decision feed cards (brand status + next action)", params: ["groupId"] },
+  { method: "GET",  path: "/api/pulse/what-changed",      description: "Recent brand file changes", params: ["groupId"] },
+  { method: "GET",  path: "/api/pulse/spike-stack",       description: "Spike signal stack", params: ["groupId"] },
+  { method: "GET",  path: "/api/pulse/fresh-intel",       description: "Fresh intelligence from signals", params: ["groupId"] },
+  { method: "GET",  path: "/api/pulse/social-highlights", description: "Social performance highlights", params: ["groupId"] },
+  { method: "GET",  path: "/api/pulse/archetype-cards",   description: "Audience archetype cards", params: ["groupId"] },
+  { method: "GET",  path: "/api/pulse/live-proof",        description: "Live social proof feed", params: ["groupId"] },
+
+  // Pulse snapshot (Lane 5): coalesced single-shot read for the rebuilt
+  // Pulse page. Wave A is a stubbed aggregator owned by silverspark; the
+  // route slot ships in Lane 1's auth PR so the dashboard can compile
+  // against the contract. PulseSnapshot type lives at lib/types/pulse.ts.
+  { method: "GET",  path: "/api/pulse/snapshot",          description: "Coalesced Pulse snapshot: funnel + brand health + actions + activity + media + publish", params: ["fields"], errors: [] },
+
+  // Signals / Trend radar
+  { method: "GET",  path: "/api/trends/hot-context",      description: "Hot market context (landscape + competitors)", params: ["groupId"] },
+  { method: "GET",  path: "/api/trends/feed",             description: "Trends feed", params: ["groupId"] },
+
+  // Signals tab
+  { method: "GET",  path: "/api/signals",                 description: "Signal feed with optional filter", params: ["filter", "platform", "stream", "time"] },
+  { method: "GET",  path: "/api/signals/:id",             description: "Get signal by id" },
+  { method: "GET",  path: "/api/signals/baseline",        description: "Metric baselines" },
+  { method: "POST", path: "/api/signals/dismiss",         description: "Dismiss a signal", body: { id: "number" }, dryRun: true, errors: ["BAD_INPUT", "NOT_FOUND", "RATE_LIMITED"] },
+  { method: "POST", path: "/api/signals/approve",         description: "Approve a signal", body: { id: "number" }, dryRun: true, errors: ["BAD_INPUT", "NOT_FOUND", "RATE_LIMITED"] },
+  { method: "POST", path: "/api/signals/flag",            description: "Flag a signal with reason", body: { id: "number", reason: "string" }, dryRun: true, errors: ["BAD_INPUT", "NOT_FOUND", "RATE_LIMITED"] },
+
+  // Plan + compete (mktg CLI bridge; wrapRoute + mapMktgErrorCode)
+  { method: "GET",  path: "/api/plan",                    description: "Prioritized task queue (mktg plan --json)", params: ["fields"], errors: ["BAD_INPUT", "UPSTREAM_FAILED"] },
+  { method: "GET",  path: "/api/plan/next",               description: "Single highest-priority task, {task: PlanTask|null} (mktg plan next --json)", params: ["fields"], errors: ["BAD_INPUT", "UPSTREAM_FAILED"] },
+  { method: "GET",  path: "/api/compete",                 description: "Competitor watchlist {urls, total} (mktg compete list --json)", params: ["fields"], errors: ["BAD_INPUT", "UPSTREAM_FAILED"] },
+  { method: "GET",  path: "/api/compete/scan",            description: "Scan tracked competitors for changes {results, changed, new, errors} (mktg compete scan --json). Network call; slow.", params: ["fields"], errors: ["BAD_INPUT", "UPSTREAM_FAILED"] },
+
+  // HQ audience summary
+  { method: "GET",  path: "/api/audience/profiles",       description: "Parsed audience persona cards", params: ["groupId"] },
+
+  // HQ next actions
+  { method: "GET",  path: "/api/opportunities",           description: "Ranked action opportunities from /cmo", params: ["groupId"] },
+
+  // Intelligence + Briefs
+  { method: "GET",  path: "/api/intelligence/latest",     description: "Latest intelligence briefs", params: ["groupId"] },
+  { method: "GET",  path: "/api/briefs",                  description: "All generated briefs", params: ["groupId"] },
+  { method: "GET",  path: "/api/research/active",         description: "Active research jobs", params: ["groupId"] },
+
+  // Skills
+  { method: "GET",  path: "/api/skills",                  description: "All installed skills from mktg list --json --routing" },
+  { method: "GET",  path: "/api/skills/:name",            description: "Single skill detail" },
+  { method: "POST", path: "/api/skill/run",               description: "Queue a skill execution via /cmo", body: { name: "string", args: "object?" }, dryRun: true, errors: ["BAD_INPUT", "RATE_LIMITED"] },
+
+  // Jobs
+  { method: "GET",  path: "/api/jobs/:id",                description: "Job status by id" },
+  { method: "GET",  path: "/api/jobs/:id/stream",         description: "SSE stream of job events" },
+
+  // /cmo
+  { method: "POST", path: "/api/cmo/playbook",            description: "Queue a named /cmo playbook", body: { name: "string" }, dryRun: true, errors: ["BAD_INPUT", "RATE_LIMITED"] },
+
+  // Setup / onboarding
+  { method: "POST", path: "/api/init",                    description: "Initialize mktg project (mktg init)", body: { from: "string?" }, dryRun: true, errors: ["BAD_INPUT", "UPSTREAM_FAILED", "RATE_LIMITED"] },
+  { method: "POST", path: "/api/settings/env",            description: "Write API keys to .env.local. Destructive — requires ?confirm=true", body: { "[key]": "string" }, dryRun: true, confirm: true, errors: ["BAD_INPUT", "CONFIRM_REQUIRED", "RATE_LIMITED"] },
+  { method: "GET",  path: "/api/settings/env/status",     description: "Per-key set/unset map for known env vars (NEVER returns values)", params: ["fields"], errors: [] },
+  { method: "POST", path: "/api/onboarding/foundation",   description: "Initialize 3 foundation brand files; emits foundation:progress + foundation:complete SSE events", body: { from: "string?", seed: "boolean?" }, dryRun: true, errors: ["BAD_INPUT", "UPSTREAM_FAILED", "RATE_LIMITED"] },
+  { method: "GET",  path: "/api/onboarding/stream",       description: "SSE stream of foundation initialization progress (filter on the global stream)" },
+  { method: "POST", path: "/api/brand/refresh",           description: "Refresh foundation brand files using the same initialization plumbing", body: { from: "string?", seed: "boolean?" }, dryRun: true, errors: ["BAD_INPUT", "UPSTREAM_FAILED", "RATE_LIMITED"] },
+  { method: "POST", path: "/api/brand/reset",             description: "Wipe brand/ files back to templates. Destructive — requires ?confirm=true", body: {}, dryRun: true, confirm: true, errors: ["BAD_INPUT", "UPSTREAM_FAILED", "RATE_LIMITED"] },
+
+  // Brand docs editor
+  { method: "GET",  path: "/api/brand/files",             description: "List every brand/*.md file with freshness chips (fresh|stale|template|missing)", params: ["fields"], accepts: ["application/x-ndjson"], errors: [] },
+  { method: "GET",  path: "/api/brand/read",              description: "Read a single brand file's content + mtime (optimistic-lock support)", params: ["file", "fields"], errors: ["BAD_INPUT", "PATH_TRAVERSAL", "NOT_FOUND"] },
+  { method: "GET",  path: "/api/assets/file",             description: "Serve a project-local asset file for studio previews", params: ["path"], errors: ["BAD_INPUT", "PATH_TRAVERSAL", "NOT_FOUND"] },
+  { method: "POST", path: "/api/brand/write",             description: "Atomic write with mtime-conflict detection. Fires brand-file-changed + activity-new on success. CONFLICT (HTTP 409) when expectedMtime mismatches.", body: { file: "string", content: "string", expectedMtime: "string?" }, dryRun: true, errors: ["BAD_INPUT", "PATH_TRAVERSAL", "CONFLICT", "RATE_LIMITED"] },
+  { method: "POST", path: "/api/brand/regenerate",        description: "Queue the owning skill (per brand/SCHEMA.md) to re-research a single file. Returns jobId; /cmo executes.", body: { file: "string" }, dryRun: true, errors: ["BAD_INPUT", "PATH_TRAVERSAL", "RATE_LIMITED"] },
+
+  // Content workspace
+  { method: "GET",  path: "/api/cmo/content/manifest",    description: "Rebuildable local content manifest from markdown, media files, and .cmo/content.meta.json", params: ["fields"], errors: ["BAD_INPUT"] },
+  { method: "GET",  path: "/api/cmo/content/file",        description: "Read a project-local markdown/text artifact for source editing", params: ["path", "fields"], errors: ["BAD_INPUT", "PATH_TRAVERSAL", "NOT_FOUND"] },
+  { method: "PUT",  path: "/api/cmo/content/file",        description: "Write a project-local markdown/text artifact with optional mtime conflict detection", body: { path: "string", content: "string", expectedMtime: "string?" }, dryRun: true, errors: ["BAD_INPUT", "PATH_TRAVERSAL", "CONFLICT", "RATE_LIMITED"] },
+  { method: "GET",  path: "/api/cmo/content/media",       description: "Serve project-local media with HTTP Range support for video preview/seek", params: ["path"], errors: ["BAD_INPUT", "PATH_TRAVERSAL", "NOT_FOUND"] },
+  { method: "GET",  path: "/api/cmo/content/events/stream", description: "SSE stream for content-file-changed manifest invalidation" },
+  { method: "PATCH", path: "/api/cmo/content/meta",       description: "Patch .cmo/content.meta.json asset/group metadata", body: { assetId: "string?", groupId: "string?", patch: "object" }, dryRun: true, errors: ["BAD_INPUT", "RATE_LIMITED"] },
+  { method: "POST", path: "/api/cmo/content/reindex",     description: "Rebuild and return the content manifest", body: {}, dryRun: true, errors: ["BAD_INPUT", "RATE_LIMITED"] },
+
+  // Publish tab
+  { method: "GET",  path: "/api/publish/adapters",        description: "List available publish adapters", params: ["fields"], accepts: ["application/x-ndjson"] },
+  { method: "GET",  path: "/api/publish/integrations",    description: "List connected postiz providers", params: ["adapter", "fields"], accepts: ["application/x-ndjson"] },
+  { method: "GET",  path: "/api/publish/postiz/diagnostics", description: "Postiz self-host/hosted connection diagnostics", params: ["fields"] },
+  { method: "GET",  path: "/api/publish/scheduled",       description: "Scheduled + published posts from the selected adapter", params: ["adapter", "startDate", "endDate", "fields"], accepts: ["application/x-ndjson"] },
+  { method: "GET",  path: "/api/publish/history",         description: "Publish history from local SQLite publish_log", params: ["limit", "offset", "fields"], accepts: ["application/x-ndjson"] },
+  { method: "POST", path: "/api/publish",                 description: "Publish content via adapter", body: { adapter: "string", manifest: "object", confirm: "boolean?" }, dryRun: true, errors: ["BAD_INPUT", "UPSTREAM_FAILED", "RATE_LIMITED"] },
+  { method: "GET",  path: "/api/publish/native/account",  description: "Local mktg-native workspace account and API key summary" },
+  { method: "POST", path: "/api/publish/native/providers",description: "Create or update a local mktg-native provider", body: { id: "string?", identifier: "string", name: "string", profile: "string", picture: "string?", disabled: "boolean?" }, dryRun: true, errors: ["BAD_INPUT", "RATE_LIMITED"] },
+
+  // /cmo → studio control surface
+  { method: "POST", path: "/api/activity/log",            description: "Log an activity entry from /cmo (skill run, brand write, etc.)", body: { kind: "string", skill: "string?", summary: "string", detail: "string?", filesChanged: "string[]?", meta: "object?" }, dryRun: true, errors: ["BAD_INPUT", "RATE_LIMITED"] },
+  { method: "DELETE", path: "/api/activity/:id",          description: "Delete one activity row by id. Destructive — requires ?confirm=true. Fires `activity-deleted` SSE.", dryRun: true, confirm: true, errors: ["BAD_INPUT", "CONFIRM_REQUIRED", "NOT_FOUND", "RATE_LIMITED"] },
+  { method: "GET",  path: "/api/activity",                description: "Recent activity entries", params: ["kind", "skill", "limit", "offset", "fields"], accepts: ["application/x-ndjson"] },
+  { method: "POST", path: "/api/opportunities/push",      description: "Push a recommended action onto HQ next actions", body: { skill: "string", reason: "string", priority: "number?", prerequisites: "object?" }, dryRun: true, errors: ["BAD_INPUT", "RATE_LIMITED"] },
+  { method: "POST", path: "/api/navigate",                description: "Tell the dashboard to switch tabs", body: { tab: "string", filter: "object?" }, dryRun: true, errors: ["BAD_INPUT", "RATE_LIMITED"] },
+  { method: "POST", path: "/api/toast",                   description: "Show a transient toast notification", body: { level: "string", message: "string", duration: "number?" }, dryRun: true, errors: ["BAD_INPUT", "RATE_LIMITED"] },
+  { method: "POST", path: "/api/highlight",               description: "Highlight a tab/element to draw user attention", body: { tab: "string", selector: "string?", reason: "string?" }, dryRun: true, errors: ["BAD_INPUT", "RATE_LIMITED"] },
+  { method: "POST", path: "/api/brand/note",              description: "Note that /cmo wrote a brand file excerpt (for activity feed)", body: { file: "string", excerpt: "string" }, dryRun: true, errors: ["BAD_INPUT", "RATE_LIMITED"] },
+
+  // Events
+  { method: "GET",  path: "/api/events",                  description: "Global SSE stream (brand changes, skill completions)" },
+
+  // Catalog
+  { method: "GET",  path: "/api/catalog/list",            description: "List all upstream catalogs" },
+  { method: "GET",  path: "/api/catalog/info/:name",      description: "Catalog detail by name" },
+  { method: "GET",  path: "/api/catalog/status",          description: "Catalog health status" },
+  { method: "GET",  path: "/api/seo/status",              description: "OpenSEO readiness snapshot: catalog config, project binding, .seo inventory, keyword-plan state, named readiness, app URL", params: ["fields"] },
+];
+
+// ---------------------------------------------------------------------------
+// wrapRoute migration (Agent DX 21/21 — T4)
+//
+// `wrapRoute` from lib/dx.ts is the single source of truth for the route
+// contract: error envelope, dryRun, fields, NDJSON, access log.
+// Rate limiting is applied once at the fetch perimeter (not inside wrapRoute).
+// Migrated wrapRoute handlers live under server/routes/*.ts and are imported
+// above. The remaining inline if-blocks in the dispatcher either:
+//   - serve SSE (which bypasses the JSON envelope), or
+//   - return shapes that wrapRoute can't represent yet (degraded reads,
+//     job creation with custom top-level fields, path-param routes that
+//     need a regex match before invocation).
+// Each opt-in route has the same wire contract as before with one
+// uniformity change: success bodies are `{ok:true, data:T}` (no extra
+// top-level fields like `id` — those nest into `data`).
+//
+// Deliberately NOT wrapped (served inline below, bare shapes documented in
+// docs/cmo-api.md "T29 bare-shape exception"): /api/health (integration test
+// pins its shape), /api/opportunities, /api/briefs, /api/catalog/*.
+// ---------------------------------------------------------------------------
+
+
+
+const INTELLIGENCE_LATEST_ROUTE = wrapRoute({
+  method: "GET",
+  listResponse: true,
+  handler: async () => ({
+    ok: true as const,
+    data: queryAll<Record<string, unknown>>(
+      "SELECT * FROM briefs ORDER BY created_at DESC LIMIT 10",
+    ),
+  }),
+});
+
+
+const RESEARCH_ACTIVE_ROUTE = wrapRoute({
+  method: "GET",
+  listResponse: true,
+  handler: async () => ({
+    ok: true as const,
+    data: listJobs()
+      .filter((j) => j.status === "running" && j.kind.startsWith("research"))
+      .map((j) => ({ id: j.id, kind: j.kind, status: j.status, startedAt: j.startedAt })),
+  }),
+});
+
+const CMO_PLAYBOOK_BODY = z.object({ name: z.string().min(1).max(128) });
+
+const CMO_PLAYBOOK_ROUTE = wrapRoute<z.infer<typeof CMO_PLAYBOOK_BODY>, { jobId: string; playbook: string }>({
+  method: "POST",
+  inputSchema: CMO_PLAYBOOK_BODY,
+  dryRun: true,
+  handler: async (input) => {
+    const ctrl = rejectControlChars(input.name, "playbook name");
+    if (!ctrl.ok) {
+      return { ok: false as const, code: "CONTROL_CHARS_REJECTED" as const, message: ctrl.message };
+    }
+    const job = createJob(`playbook:${input.name}`, { playbookName: input.name });
+    runJob(job.id, async (_job, emit) => {
+      emit(`Playbook queued: ${input.name}. Run /cmo in your terminal to execute it.`);
+      return { status: "queued", playbook: input.name };
+    });
+    return { ok: true as const, data: { jobId: job.id, playbook: input.name } };
+  },
+});
+
+// ---------------------------------------------------------------------------
+// Inline body schemas — navigate/foundation stay local (canonical tab enum
+// for /api/schema differs from the legacy-accepting parser). Other POST body
+// schemas are imported from lib/schemas.ts (SSOT) or route modules.
+// ---------------------------------------------------------------------------
+
+const PRIMARY_NAV_TABS = ["pulse", "signals", "publish", "brand"] as const;
+
+const NAVIGATE_BODY = z.object({
+  tab: z.enum(PRIMARY_NAV_TABS),
+  filter: z.record(z.string(), z.unknown()).optional(),
+});
+
+const NAVIGATE_REQUEST_BODY = z.object({
+  tab: z.string().min(1).max(64),
+  filter: z.record(z.string(), z.unknown()).optional(),
+});
+
+// Accepts current canonical ids and pre-rename legacy ids ("hq" -> "pulse",
+// "content" -> "signals", plus collapses for trends/audience/opportunities).
+// One-release window for /cmo and external callers to roll forward.
+function normalizeNavigateTab(tab: string): { tab: (typeof PRIMARY_NAV_TABS)[number] } | null {
+  if ((PRIMARY_NAV_TABS as readonly string[]).includes(tab)) {
+    return { tab: tab as (typeof PRIMARY_NAV_TABS)[number] };
+  }
+  if (tab === "hq") return { tab: "pulse" };
+  if (tab === "content" || tab === "trends") return { tab: "signals" };
+  if (tab === "audience" || tab === "opportunities") return { tab: "pulse" };
+  return null;
+}
+
+const FOUNDATION_BODY = z.object({
+  from: z.string().url().optional(),
+  seed: z.boolean().optional(),
+});
+
+// Single source of truth: register schemas with the introspection registry
+// (powers GET /api/schema?route=… inputSchema enrichment).
+//
+// One call per route. Adding a new POST route? Add a registerRouteSchema()
+// call here AND export the body schema as a const. The regression test in
+// tests/server/route-schema.test.ts checks every ROUTE_SCHEMA entry with a
+// `body: {...}` declaration has a matching registry entry.
+registerRouteSchema("/api/brand/write",          { method: "POST", body: BRAND_WRITE_BODY });
+registerRouteSchema("/api/brand/regenerate",     { method: "POST", body: BRAND_REGENERATE_BODY });
+registerRouteSchema("/api/activity/log",         { method: "POST", body: ACTIVITY_LOG_BODY });
+registerRouteSchema("/api/opportunities/push",   { method: "POST", body: OPPORTUNITIES_PUSH_BODY });
+registerRouteSchema("/api/navigate",             { method: "POST", body: NAVIGATE_BODY });
+registerRouteSchema("/api/toast",                { method: "POST", body: TOAST_BODY });
+registerRouteSchema("/api/highlight",            { method: "POST", body: HIGHLIGHT_BODY });
+registerRouteSchema("/api/brand/note",           { method: "POST", body: BRAND_NOTE_BODY });
+registerRouteSchema("/api/signals/dismiss",      { method: "POST", body: SIGNAL_ID_BODY });
+registerRouteSchema("/api/signals/approve",      { method: "POST", body: SIGNAL_ID_BODY });
+registerRouteSchema("/api/signals/flag",         { method: "POST", body: SIGNAL_FLAG_BODY });
+registerRouteSchema("/api/skill/run",            { method: "POST", body: SKILL_RUN_BODY });
+registerRouteSchema("/api/cmo/playbook",         { method: "POST", body: CMO_PLAYBOOK_BODY });
+registerRouteSchema("/api/init",                 { method: "POST", body: INIT_BODY });
+registerRouteSchema("/api/settings/env",         { method: "POST", body: SETTINGS_ENV_BODY });
+registerRouteSchema("/api/onboarding/foundation",{ method: "POST", body: FOUNDATION_BODY });
+registerRouteSchema("/api/brand/refresh",        { method: "POST", body: FOUNDATION_BODY });
+registerRouteSchema("/api/brand/reset",          { method: "POST", body: BRAND_RESET_BODY });
+registerRouteSchema("/api/publish",              { method: "POST", body: PUBLISH_BODY });
+registerRouteSchema("/api/publish/native/providers", { method: "POST", body: PUBLISH_NATIVE_PROVIDER_BODY });
+registerRouteSchema("/api/cmo/content/file",     { method: "PUT", body: CONTENT_FILE_WRITE_BODY });
+registerRouteSchema("/api/cmo/content/meta",     { method: "PATCH", body: CONTENT_META_PATCH_BODY });
+registerRouteSchema("/api/cmo/content/reindex",  { method: "POST", body: CONTENT_REINDEX_BODY });
+
+// ---------------------------------------------------------------------------
+// Router
+// ---------------------------------------------------------------------------
+
+const server = Bun.serve({
+  port: PORT,
+  // Localhost-only bind. Combined with the Host header allowlist in
+  // lib/auth.ts, this is the studio's network perimeter: agents and
+  // browser tabs cannot reach the server from any other interface, and a
+  // DNS-rebinding tab cannot bypass the bind.
+  hostname: "127.0.0.1",
+  // Bun.serve defaults to a 10s idleTimeout which silently closes our SSE
+  // streams every ~10s — that's the underlying cause of Bug #8 ("subscribers
+  // drops after ~30s"). 255 is the maximum Bun supports; combined with the
+  // 15s comment-line keepalive in lib/sse.ts, SSE connections stay alive
+  // indefinitely under normal use.
+  idleTimeout: 255,
+
+  async fetch(req) {
+    const url = new URL(req.url);
+    const method = req.method;
+    let corsHeaders = cors(req);
+
+    // OPTIONS preflight — browsers cannot send Authorization on preflight,
+    // so this stays open. The actual request that follows still goes
+    // through the auth gate below.
+    if (method === "OPTIONS") {
+      return new Response(null, { status: 204, headers: corsHeaders });
+    }
+
+    // Auth perimeter v1 (Lane 1, Wave A). Public allowlist (`/api/health`,
+    // `/api/schema`, `/api/help`) bypasses the bearer check; the Host-header
+    // allowlist always applies (DNS rebinding mitigation).
+    const auth = checkAuth(req, url);
+    if (!auth.ok) {
+      return errResponse(
+        auth.reason === "FORBIDDEN_HOST" ? "BAD_INPUT" : "UNAUTHORIZED",
+        auth.message,
+        auth.status,
+        auth.fix,
+        corsHeaders,
+      );
+    }
+
+    // Rate limit mutations (Agent DX axis 5).
+    // GETs are idempotent and unthrottled.
+    // Applied once at the perimeter — wrapRoute does NOT re-check (would
+    // double-count mutating requests against the 60/min quota).
+    const rate = checkRateLimit(req);
+    if (!rate.ok) {
+      return err(
+        `Rate limit exceeded — retry in ${rate.retryAfterSec}s`,
+        429,
+        { ...corsHeaders, "Retry-After": String(rate.retryAfterSec) },
+        "Back off — the studio allows 60 mutating requests per minute per client",
+      );
+    }
+    // Fail-open when the store is degraded: let the request through but tag
+    // every response so callers know the quota count is not authoritative.
+    if (rate.degraded) {
+      corsHeaders = { ...corsHeaders, "X-Rate-Limit-Degraded": "true" };
+    }
+
+    // -----------------------------------------------------------------------
+    // GET /api/health
+    //
+    // Kept inline (NOT wrapRoute-migrated) because the integration suite
+    // (tests/integration/server-boot.test.ts) pins the response to a flat
+    // `{ok, version, ts}` shape rather than the wrapRoute envelope
+    // `{ok, data: {...}}`. Migrating breaks that pin.
+    // -----------------------------------------------------------------------
+    if (method === "GET" && url.pathname === "/api/health") {
+      return json(
+        {
+          ok: true,
+          version: "0.1.0",
+          ts: new Date().toISOString(),
+          subscribers: globalEmitter.size,
+        },
+        200,
+        corsHeaders,
+      );
+    }
+
+    // -----------------------------------------------------------------------
+    // GET /api/project/current
+    //
+    // Read-only identity endpoint for the Studio shell. It is intentionally
+    // derived from the active project root and does not call native publish
+    // provisioning commands, so rendering the header cannot create state.
+    // -----------------------------------------------------------------------
+    if (method === "GET" && url.pathname === "/api/project/current") {
+      const status = await mktgStatus(STUDIO_CWD);
+      const fallbackName = basename(STUDIO_CWD) || "Marketing Project";
+      const projectName = status.ok ? status.data.project : fallbackName;
+      const brandSummary = status.ok
+        ? status.data.brandSummary
+        : { populated: 0, template: 0, missing: 0, stale: 0 };
+      const brandFileCount =
+        brandSummary.populated + brandSummary.template + brandSummary.missing;
+
+      return json(
+        {
+          ok: true,
+          data: {
+            name: projectName,
+            root: STUDIO_CWD,
+            rootLabel: rootLabel(STUDIO_CWD),
+            health: status.ok ? status.data.health : "unknown",
+            brand: {
+              ...brandSummary,
+              total: brandFileCount,
+            },
+            dbPath: resolveStudioDbPath(process.cwd()),
+            sessionId: process.env.MKTG_STUDIO_SESSION || null,
+            launchIntent: process.env.MKTG_STUDIO_INTENT || null,
+            logo: discoverProjectLogo(projectName),
+            nativePublish: countNativePublishState(STUDIO_CWD),
+            fetchedAt: new Date().toISOString(),
+          },
+        },
+        200,
+        corsHeaders,
+      );
+    }
+
+    // -----------------------------------------------------------------------
+    // GET /api/schema — Agent DX axis 3: runtime self-discovery
+    // Supports ?route=<path> to fetch a single entry.
+    // -----------------------------------------------------------------------
+    if (method === "GET" && url.pathname === "/api/schema") {
+      const routeFilter = url.searchParams.get("route");
+      if (routeFilter) {
+        const ctrl = rejectControlChars(routeFilter, "route");
+        if (!ctrl.ok) return err(ctrl.message, 400, corsHeaders);
+        const matches = ROUTE_SCHEMA.filter((r) => r.path === routeFilter);
+        if (matches.length === 0) {
+          return err(
+            `Route not registered: ${routeFilter}`,
+            404,
+            corsHeaders,
+            "Call GET /api/schema with no query to list every registered path",
+          );
+        }
+        // JSON Schema 2020-12 inputSchema enrichment for routes
+        // that have a registered Zod body (no-op on unregistered entries).
+        return json(
+          { ok: true, routes: matches.map(enrichRouteEntry) },
+          200,
+          corsHeaders,
+        );
+      }
+      return json(
+        { ok: true, routes: enrichRouteSchema(ROUTE_SCHEMA) },
+        200,
+        corsHeaders,
+      );
+    }
+
+    // -----------------------------------------------------------------------
+    // GET /api/help — terse agent cheat-sheet (Agent DX axis 7).
+    // -----------------------------------------------------------------------
+    if (method === "GET" && url.pathname === "/api/help") {
+      return json(
+        {
+          ok: true,
+          data: {
+            summary:
+              "mktg-studio is a local Bun server (:3001) that exposes the brand/ files + SQLite + postiz API to /cmo and the Next.js dashboard.",
+            envelopes: {
+              success: `{"ok": true, "data": ...}`,
+              error: `{"ok": false, "error": {"code": "<StudioErrorCode>", "message": "...", "fix": "..."}}`,
+              degraded: `{"ok": true, "data": [], "degraded": true, "degradedReason": "..."}`,
+            },
+            errorCodes: [
+              "BAD_INPUT",
+              "NOT_FOUND",
+              "UNAUTHORIZED",
+              "CONFIRM_REQUIRED",
+              "CONFLICT",
+              "RATE_LIMITED",
+              "UPSTREAM_FAILED",
+              "PARSE_ERROR",
+              "INTERNAL",
+            ],
+            queryParams: {
+              fields: "?fields=a,b.c — dot-path projection on GETs",
+              dryRun: "?dryRun=true — mutations validate but write nothing",
+              confirm: "?confirm=true — required on destructive ops",
+              route: "/api/schema?route=/api/activity — fetch one entry",
+            },
+            headers: {
+              "Accept: application/x-ndjson":
+                "On list GETs, stream rows as NDJSON instead of a JSON envelope",
+              "Content-Type: application/json":
+                "Required on POST bodies (raw JSON, no form fields)",
+            },
+            entryPoints: [
+              { path: "/api/schema", why: "discover every route + body shape" },
+              { path: "/api/events", why: "SSE stream of dashboard events (toast, navigate, activity-new, ...)" },
+              { path: "/api/activity/log", why: "POST to append to the activity feed" },
+              { path: "/api/opportunities/push", why: "POST to recommend an action to the user" },
+              { path: "/api/navigate", why: "POST to switch the dashboard tab" },
+              { path: "/api/toast", why: "POST to show a transient notification" },
+              { path: "/api/publish", why: "POST a manifest through mktg publish (postiz, typefully, ...)" },
+            ],
+            docs: "docs/cmo-api.md",
+          },
+        },
+        200,
+        corsHeaders,
+      );
+    }
+
+    // -----------------------------------------------------------------------
+    // GET /api/auth/bootstrap -- localhost-only browser session bootstrap.
+    // The bearer remains server-side; the browser receives only an HttpOnly,
+    // same-site session cookie, so neither JavaScript nor navigation URLs
+    // contain the credential.
+    //
+    // SECURITY: this endpoint is safe ONLY because Bun.serve binds
+    // 127.0.0.1 (see `hostname: "127.0.0.1"` in the Bun.serve config
+    // above) and the Host header allowlist runs before the public-path
+    // check (lib/auth.ts::checkAuth). If Studio is ever made
+    // network-accessible (binding to 0.0.0.0, exposed via tunnel, or
+    // running behind a reverse proxy that strips the Host check), this
+    // endpoint MUST be removed from PUBLIC_PATHS and re-gated.
+    // -----------------------------------------------------------------------
+    if (method === "GET" && url.pathname === "/api/auth/bootstrap") {
+      return json(
+        { ok: true, data: { authenticated: true } },
+        200,
+        {
+          ...corsHeaders,
+          "Cache-Control": "no-store",
+          "Set-Cookie": studioSessionCookie(STUDIO_TOKEN),
+        },
+      );
+    }
+
+    // -----------------------------------------------------------------------
+    // GET /api/events — global SSE broadcast
+    // -----------------------------------------------------------------------
+    if (method === "GET" && url.pathname === "/api/events") {
+      return globalEmitter.subscribe("*", corsHeaders);
+    }
+
+    // -----------------------------------------------------------------------
+    // HQ legacy signal routes + Trends — wrapRoute migrated (T4)
+    //
+    // Stubs that return empty scaffolds. wrapRoute gives them the uniform
+    // {ok, data} envelope, ?fields= projection, NDJSON streaming, and the
+    // structured error envelope on bad input — for free.
+    // -----------------------------------------------------------------------
+    if (method === "GET" && url.pathname === "/api/pulse/decision-feed") {
+      return EMPTY_LIST_ROUTE(req, corsHeaders);
+    }
+    if (method === "GET" && url.pathname === "/api/pulse/what-changed") {
+      return EMPTY_LIST_ROUTE(req, corsHeaders);
+    }
+    if (method === "GET" && url.pathname === "/api/pulse/spike-stack") {
+      return EMPTY_LIST_ROUTE(req, corsHeaders);
+    }
+    if (method === "GET" && url.pathname === "/api/pulse/fresh-intel") {
+      return EMPTY_LIST_ROUTE(req, corsHeaders);
+    }
+    if (method === "GET" && url.pathname === "/api/pulse/social-highlights") {
+      return EMPTY_LIST_ROUTE(req, corsHeaders);
+    }
+    if (method === "GET" && url.pathname === "/api/pulse/archetype-cards") {
+      return EMPTY_LIST_ROUTE(req, corsHeaders);
+    }
+    if (method === "GET" && url.pathname === "/api/pulse/live-proof") {
+      return EMPTY_LIST_ROUTE(req, corsHeaders);
+    }
+
+    // GET /api/pulse/snapshot -- Lane 5.
+    //
+    // Single-shot Pulse aggregator owned by silverspark (lib/pulse-snapshot.ts).
+    // Replaces 7 SWR round-trips. Per-section try/catch lives inside the
+    // aggregator; failures push into `staleSections` rather than throw, so
+    // the only failure mode reaching this handler is a wedged SQLite
+    // handle, which the top-level `error` handler in Bun.serve catches.
+    //
+    // recentMedia: passing [] today (Pulse renders EmptyState). Wiring
+    // `buildContentManifest(STUDIO_CWD).assets` mapped to PulseMediaItem
+    // is a follow-up that lives in Lane 5's content-strip work; not
+    // gating Pulse on it.
+    //
+    // Auth: GETs go through the same perimeter as every other private
+    // route -- the auth gate at the top of `fetch()` enforces (1) the
+    // Host header allowlist (DNS rebinding mitigation) and (2) either the
+    // API client's bearer header or the dashboard's HttpOnly session cookie.
+    if (method === "GET" && url.pathname === "/api/pulse/snapshot") {
+      const data = buildPulseSnapshot({ db: getDb(), projectRoot: STUDIO_CWD, recentMedia: [] });
+      return respondObject(url, data, corsHeaders);
+    }
+
+    if (method === "GET" && url.pathname === "/api/trends/hot-context") {
+      return TRENDS_HOT_CONTEXT_ROUTE(req, corsHeaders);
+    }
+    if (method === "GET" && url.pathname === "/api/trends/feed") {
+      return EMPTY_LIST_ROUTE(req, corsHeaders);
+    }
+
+    // -----------------------------------------------------------------------
+    // Signals tab — wrapRoute migrated (T4)
+    // -----------------------------------------------------------------------
+    if (method === "GET" && url.pathname === "/api/signals") {
+      return SIGNALS_LIST_ROUTE(req, corsHeaders);
+    }
+    // Plan + compete — mktg CLI bridge (wrapRoute)
+    if (method === "GET" && url.pathname === "/api/plan") return PLAN_ROUTE(req, corsHeaders);
+    if (method === "GET" && url.pathname === "/api/plan/next") return PLAN_NEXT_ROUTE(req, corsHeaders);
+    if (method === "GET" && url.pathname === "/api/compete") return COMPETE_LIST_ROUTE(req, corsHeaders);
+    if (method === "GET" && url.pathname === "/api/compete/scan") return COMPETE_SCAN_ROUTE(req, corsHeaders);
+    if (method === "GET" && url.pathname === "/api/signals/baseline") {
+      return SIGNALS_BASELINE_ROUTE(req, corsHeaders);
+    }
+
+    // GET /api/signals/:id  (must come after /baseline)
+    const signalMatch = url.pathname.match(/^\/api\/signals\/(\d+)$/);
+    if (method === "GET" && signalMatch) {
+      const { queryOne } = await import("./lib/sqlite.ts");
+      const signal = queryOne<Record<string, unknown>>("SELECT * FROM signals WHERE id = ?", [signalMatch[1]]);
+      if (!signal) return err("Signal not found", 404, corsHeaders);
+      return json({ ok: true, data: normalizeSignalRow(signal) }, 200, corsHeaders);
+    }
+
+    // POST /api/signals/{dismiss,approve,flag} — wrapRoute migrated (T4)
+    if (method === "POST" && url.pathname === "/api/signals/dismiss") {
+      return SIGNAL_DISMISS_ROUTE(req, corsHeaders);
+    }
+    if (method === "POST" && url.pathname === "/api/signals/approve") {
+      return SIGNAL_APPROVE_ROUTE(req, corsHeaders);
+    }
+    if (method === "POST" && url.pathname === "/api/signals/flag") {
+      return SIGNAL_FLAG_ROUTE(req, corsHeaders);
+    }
+
+    // -----------------------------------------------------------------------
+    // HQ audience summary
+    // -----------------------------------------------------------------------
+    // -----------------------------------------------------------------------
+    // Audience / Opportunities / Briefs — bare structured shape (T29)
+    //
+    // These three tab-feeding GETs return their structured shape AT THE TOP
+    // LEVEL (no `{ok:true, data}` envelope). The UI components (audience-tab,
+    // opportunities-tab, briefs-tab) consume `useSWR<TypeResponse>(url, fetcher)`
+    // and destructure `{profiles, …}` directly. Per CLAUDE.md axis 1: "plain
+    // data on pure reads is acceptable for tab-feeding endpoints."
+    //
+    // Other consumers (agents) can still use ?fields= projection — the bare
+    // shape is the same input as the field-mask helper.
+    // -----------------------------------------------------------------------
+    if (method === "GET" && url.pathname === "/api/audience/profiles") {
+      return json(
+        {
+          profiles: [],
+          platformIntelligence: [],
+          byTheNumbers: [],
+          fetchedAt: new Date().toISOString(),
+        },
+        200,
+        corsHeaders,
+      );
+    }
+
+    if (method === "GET" && url.pathname === "/api/opportunities") {
+      // The `opportunities` table is the canonical action queue, populated
+      // by /cmo's analysis loop. `watchItems` and `actions` are unwired
+      // today; they'll come from /cmo too. Empty arrays preserve the UI's
+      // optional-rendering path.
+      const rows = queryAll<{
+        id: number;
+        skill: string;
+        reason: string;
+        priority: number;
+        prerequisites: string | null;
+        status: string;
+        created_at: string;
+      }>(
+        "SELECT id, skill, reason, priority, prerequisites, status, created_at FROM opportunities WHERE status = 'pending' ORDER BY priority DESC LIMIT 20",
+      );
+
+      // Map the SQLite rows into the ContentOpportunity[] shape the UI
+      // component expects. The opportunities table is the source of truth.
+      const opportunities = rows.map((r) => ({
+        hook: r.reason,
+        archetype: r.skill,
+        urgency: r.priority >= 80 ? "now" : r.priority >= 50 ? "soon" : "watch",
+      }));
+
+      return json(
+        {
+          opportunities,
+          watchItems: [] as { item: string; action?: string }[],
+          actions: [] as Array<Record<string, unknown>>,
+          fetchedAt: new Date().toISOString(),
+        },
+        200,
+        corsHeaders,
+      );
+    }
+
+    if (method === "GET" && url.pathname === "/api/intelligence/latest") {
+      return INTELLIGENCE_LATEST_ROUTE(req, corsHeaders);
+    }
+
+    if (method === "GET" && url.pathname === "/api/briefs") {
+      const briefs = queryAll<Record<string, unknown>>(
+        "SELECT * FROM briefs ORDER BY created_at DESC LIMIT 50",
+      );
+      return json(
+        {
+          agents: [] as { _id: string; name: string; agentType?: string }[],
+          briefs,
+          fetchedAt: new Date().toISOString(),
+        },
+        200,
+        corsHeaders,
+      );
+    }
+
+    if (method === "GET" && url.pathname === "/api/research/active") {
+      return RESEARCH_ACTIVE_ROUTE(req, corsHeaders);
+    }
+
+    // GET /api/activity — wrapRoute migrated (T4)
+    if (method === "GET" && url.pathname === "/api/activity") {
+      return ACTIVITY_LIST_ROUTE(req, corsHeaders);
+    }
+
+    // -----------------------------------------------------------------------
+    // /cmo → studio control surface
+    // -----------------------------------------------------------------------
+
+    // POST /api/activity/log — wrapRoute migrated (T4)
+    if (method === "POST" && url.pathname === "/api/activity/log") {
+      return ACTIVITY_LOG_ROUTE(req, corsHeaders);
+    }
+
+    // DELETE /api/activity/:id?confirm=true — must come AFTER /api/activity/log
+    // so the regex doesn't swallow the literal `log` segment. (Match digits only.)
+    if (method === "DELETE" && /^\/api\/activity\/\d+$/.test(url.pathname)) {
+      return ACTIVITY_DELETE_ROUTE(req, corsHeaders);
+    }
+
+    // POST /api/opportunities/push — push a ranked action onto HQ
+    if (method === "POST" && url.pathname === "/api/opportunities/push") {
+      const body = await parseBody(
+        req,
+        z.object({
+          skill: z.string().min(1).max(128),
+          reason: z.string().min(1).max(2_000),
+          priority: z.number().int().min(0).max(100).optional(),
+          prerequisites: z.record(z.string(), z.unknown()).optional(),
+        }),
+      );
+      if (!body.ok) return body.res;
+
+      const idCheck = validateResourceId(body.data.skill, "skill");
+      if (!idCheck.ok) return err(idCheck.message, 400, corsHeaders);
+
+      const reasonCheck = rejectControlChars(body.data.reason, "reason");
+      if (!reasonCheck.ok) return err(reasonCheck.message, 400, corsHeaders);
+
+      if (isDryRun(url)) return json({ ok: true, dryRun: true }, 200, corsHeaders);
+
+      const result = execute(
+        `INSERT INTO opportunities (skill, reason, priority, prerequisites, status)
+         VALUES (?, ?, ?, ?, 'pending')`,
+        [
+          body.data.skill,
+          body.data.reason,
+          body.data.priority ?? 0,
+          body.data.prerequisites ? JSON.stringify(body.data.prerequisites) : null,
+        ],
+      );
+
+      const id = Number(result.lastInsertRowid);
+      const payload = {
+        id,
+        skill: body.data.skill,
+        reason: body.data.reason,
+        priority: body.data.priority ?? 0,
+        prerequisites: body.data.prerequisites ?? null,
+        status: "pending" as const,
+        createdAt: new Date().toISOString(),
+      };
+
+      globalEmitter.publish("*", { type: "opportunity-new", payload });
+
+      return json({ ok: true, id, data: payload }, 200, corsHeaders);
+    }
+
+    // POST /api/navigate — tell dashboard to switch tabs (no DB)
+    if (method === "POST" && url.pathname === "/api/navigate") {
+      const body = await parseBody(
+        req,
+        NAVIGATE_REQUEST_BODY,
+      );
+      if (!body.ok) return body.res;
+      const tabCheck = rejectControlChars(body.data.tab, "tab");
+      if (!tabCheck.ok) return err(tabCheck.message, 400, corsHeaders);
+
+      const target = normalizeNavigateTab(body.data.tab);
+      if (!target) {
+        return err(
+          `Invalid navigation tab: ${body.data.tab}`,
+          400,
+          corsHeaders,
+          "Use one of: pulse, signals, publish, brand (legacy ids hq/content are normalised)",
+        );
+      }
+
+      const filter = { ...(body.data.filter ?? {}) };
+      delete filter.mode;
+      const payload = {
+        tab: target.tab,
+        filter: Object.keys(filter).length > 0 ? filter : null,
+      };
+
+      if (isDryRun(url)) return json({ ok: true, dryRun: true, data: payload }, 200, corsHeaders);
+
+      globalEmitter.publish("*", {
+        type: "navigate",
+        payload,
+      });
+
+      return json({ ok: true }, 200, corsHeaders);
+    }
+
+    // POST /api/toast — transient toast notification
+    if (method === "POST" && url.pathname === "/api/toast") {
+      const body = await parseBody(
+        req,
+        z.object({
+          level: z.enum(["info", "success", "warn", "error"]),
+          message: z.string().min(1).max(500),
+          duration: z.number().int().min(500).max(60_000).optional(),
+        }),
+      );
+      if (!body.ok) return body.res;
+
+      const c = rejectControlChars(body.data.message, "message");
+      if (!c.ok) return err(c.message, 400, corsHeaders);
+
+      if (isDryRun(url)) return json({ ok: true, dryRun: true }, 200, corsHeaders);
+
+      globalEmitter.publish("*", {
+        type: "toast",
+        payload: {
+          level: body.data.level,
+          message: body.data.message,
+          duration: body.data.duration ?? 4_000,
+        },
+      });
+
+      return json({ ok: true }, 200, corsHeaders);
+    }
+
+    // POST /api/highlight — highlight a tab/element to draw attention
+    if (method === "POST" && url.pathname === "/api/highlight") {
+      const body = await parseBody(
+        req,
+        z.object({
+          tab: z.string().min(1).max(64),
+          selector: z.string().max(256).optional(),
+          reason: z.string().max(500).optional(),
+        }),
+      );
+      if (!body.ok) return body.res;
+
+      for (const [field, value] of Object.entries({
+        tab: body.data.tab,
+        selector: body.data.selector ?? "",
+        reason: body.data.reason ?? "",
+      })) {
+        const c = rejectControlChars(value, field);
+        if (!c.ok) return err(c.message, 400, corsHeaders);
+      }
+
+      if (isDryRun(url)) return json({ ok: true, dryRun: true }, 200, corsHeaders);
+
+      globalEmitter.publish("*", {
+        type: "highlight",
+        payload: {
+          tab: body.data.tab,
+          selector: body.data.selector ?? null,
+          reason: body.data.reason ?? null,
+        },
+      });
+
+      return json({ ok: true }, 200, corsHeaders);
+    }
+
+    // GET /api/brand/files — list brand/*.md with freshness chips
+    if (method === "GET" && url.pathname === "/api/brand/files") {
+      return BRAND_FILES_ROUTE(req, corsHeaders);
+    }
+
+    // GET /api/brand/read?file=… — read a single brand file
+    if (method === "GET" && url.pathname === "/api/brand/read") {
+      return BRAND_READ_ROUTE(req, corsHeaders);
+    }
+
+    if (method === "GET" && url.pathname === "/api/assets/file") {
+      const fileQ = url.searchParams.get("path");
+      if (!fileQ) return err("path query parameter is required", 400, corsHeaders);
+      return serveProjectAsset(req, fileQ, corsHeaders, STUDIO_CWD, routeHttp);
+    }
+
+    // POST /api/brand/write — atomic write w/ optimistic lock
+    if (method === "POST" && url.pathname === "/api/brand/write") {
+      return BRAND_WRITE_ROUTE(req, corsHeaders);
+    }
+
+    // POST /api/brand/regenerate — queue owning skill via /cmo
+    if (method === "POST" && url.pathname === "/api/brand/regenerate") {
+      return BRAND_REGENERATE_ROUTE(req, corsHeaders);
+    }
+
+    // POST /api/brand/note — note a brand file write into the activity feed
+    if (method === "POST" && url.pathname === "/api/brand/note") {
+      const body = await parseBody(
+        req,
+        z.object({
+          file: z.string().min(1).max(512),
+          excerpt: z.string().min(1).max(8_000),
+        }),
+      );
+      if (!body.ok) return body.res;
+
+      const sandboxCheck = validatePathInput(STUDIO_CWD, body.data.file);
+      if (!sandboxCheck.ok) return err(sandboxCheck.message, 400, corsHeaders);
+
+      const excerptCheck = rejectControlChars(body.data.excerpt, "excerpt");
+      if (!excerptCheck.ok) return err(excerptCheck.message, 400, corsHeaders);
+
+      if (isDryRun(url)) return json({ ok: true, dryRun: true }, 200, corsHeaders);
+
+      const summary = `Brand file updated: ${body.data.file}`;
+      const result = execute(
+        `INSERT INTO activity (kind, summary, detail, files_changed)
+         VALUES ('brand-write', ?, ?, ?)`,
+        [
+          summary,
+          body.data.excerpt.slice(0, 4_000),
+          JSON.stringify([body.data.file]),
+        ],
+      );
+
+      const id = Number(result.lastInsertRowid);
+      const payload = {
+        id,
+        kind: "brand-write" as const,
+        skill: null,
+        summary,
+        detail: body.data.excerpt.slice(0, 4_000),
+        filesChanged: [body.data.file],
+        meta: null,
+        createdAt: new Date().toISOString(),
+      };
+
+      globalEmitter.publish("*", { type: "activity-new", payload });
+      globalEmitter.publish("*", {
+        type: "brand-file-changed",
+        payload: { file: body.data.file },
+      });
+
+      return json({ ok: true, id, data: payload }, 200, corsHeaders);
+    }
+
+    // -----------------------------------------------------------------------
+    // Content workspace — extracted to server/routes/content.ts
+    // -----------------------------------------------------------------------
+    {
+      const contentRes = await tryContentRoutes(method, url, req, corsHeaders, STUDIO_CWD, routeHttp);
+      if (contentRes) return contentRes;
+    }
+
+    // -----------------------------------------------------------------------
+    // Skills
+    // -----------------------------------------------------------------------
+    if (method === "GET" && url.pathname === "/api/skills") {
+      const result = await mktgList({ routing: true, cwd: STUDIO_CWD });
+      if (!result.ok) return respondMktgError(result, corsHeaders);
+      return respondList(req, url, result.data.skills, corsHeaders);
+    }
+
+    const skillNameMatch = url.pathname.match(/^\/api\/skills\/([a-z0-9-]+)$/);
+    if (method === "GET" && skillNameMatch) {
+      const idCheck = validateResourceId(skillNameMatch[1], "skill");
+      if (!idCheck.ok) return err(idCheck.message, 400, corsHeaders);
+      const result = await mktgSkillInfo(skillNameMatch[1], { cwd: STUDIO_CWD });
+      if (!result.ok) return respondMktgError(result, corsHeaders);
+      return respondObject(url, result.data, corsHeaders);
+    }
+
+    // POST /api/skill/run — queue a skill via /cmo
+    if (method === "POST" && url.pathname === "/api/skill/run") {
+      const body = await parseBody(
+        req,
+        z.object({
+          name: z.string().min(1).max(128),
+          args: z.record(z.string(), z.unknown()).optional(),
+        }),
+      );
+      if (!body.ok) return body.res;
+
+      const idCheck = validateResourceId(body.data.name, "skill");
+      if (!idCheck.ok) return err(idCheck.message, 400, corsHeaders);
+
+      const ctrlCheck = rejectControlChars(body.data.name, "skill name");
+      if (!ctrlCheck.ok) return err(ctrlCheck.message, 400, corsHeaders);
+
+      if (isDryRun(url)) {
+        return json({ ok: true, dryRun: true, name: body.data.name }, 200, corsHeaders);
+      }
+
+      const job = createJob(body.data.name, body.data.args ?? {});
+
+      // /cmo runs in the user's Claude Code session and calls back via HTTP.
+      // This job is a placeholder entry; /cmo will report completion via POST /api/activity/log.
+      runJob(job.id, async (_job, emit) => {
+        emit(`Skill queued: ${body.data.name}. Run /cmo in your terminal to execute it.`);
+        return { status: "queued", skill: body.data.name };
+      });
+
+      return json({ ok: true, jobId: job.id }, 202, corsHeaders);
+    }
+
+    // -----------------------------------------------------------------------
+    // Jobs
+    // -----------------------------------------------------------------------
+    const jobStreamMatch = url.pathname.match(/^\/api\/jobs\/([^/]+)\/stream$/);
+    if (method === "GET" && jobStreamMatch) {
+      const jobId = jobStreamMatch[1];
+      const job = getJob(jobId);
+      if (!job) return err("Job not found", 404, corsHeaders);
+      const emitter = getJobEmitter(jobId);
+      return emitter.subscribe(jobId, corsHeaders);
+    }
+
+    const jobMatch = url.pathname.match(/^\/api\/jobs\/([^/]+)$/);
+    if (method === "GET" && jobMatch) {
+      const job = getJob(jobMatch[1]);
+      if (!job) return err("Job not found", 404, corsHeaders);
+      return json({ ok: true, data: { id: job.id, kind: job.kind, status: job.status, startedAt: job.startedAt, completedAt: job.completedAt, log: job.log, error: job.error } }, 200, corsHeaders);
+    }
+
+    // -----------------------------------------------------------------------
+    // /cmo playbook — wrapRoute migrated (T4)
+    // Note: success body is now `{ok:true, data:{jobId}}` (jobId nested under
+    // `data` per the wrapRoute envelope; previously top-level).
+    // -----------------------------------------------------------------------
+    if (method === "POST" && url.pathname === "/api/cmo/playbook") {
+      return CMO_PLAYBOOK_ROUTE(req, corsHeaders);
+    }
+
+    // -----------------------------------------------------------------------
+    // Init + Settings + Onboarding
+    // -----------------------------------------------------------------------
+    if (method === "POST" && url.pathname === "/api/init") {
+      const body = await parseBody(req, z.object({ from: z.string().url().optional() }));
+      if (!body.ok) return body.res;
+
+      if (isDryRun(url)) return json({ ok: true, dryRun: true }, 200, corsHeaders);
+
+      const job = createJob("mktg:init", { from: body.data.from });
+      runJob(job.id, async (_job, emit) => {
+        emit("Running mktg init...");
+        const args = body.data.from
+          ? ["init", "--from", body.data.from, "--yes"]
+          : ["init", "--yes"];
+        const proc = Bun.spawn(resolveMktgCommand(args), {
+          cwd: STUDIO_CWD,
+          stdout: "pipe",
+          stderr: "pipe",
+          // Strip studio bearer token so it does not leak into mktg's
+          // process env (visible via `ps eww` and any `mktg doctor --json`
+          // that echoes env). Never inherit secrets to subprocesses.
+          env: childProcessEnv(),
+        });
+        const stdout = await new Response(proc.stdout).text();
+        const stderr = await new Response(proc.stderr).text();
+        const exitCode = await proc.exited;
+        emit(stdout.trim() || "(no output)");
+        if (stderr.trim()) emit(`stderr: ${stderr.trim()}`);
+        if (exitCode !== 0) throw new Error(`mktg init exited with code ${exitCode}`);
+        return { exitCode, stdout, stderr };
+      });
+
+      return json({ ok: true, jobId: job.id }, 202, corsHeaders);
+    }
+
+    // POST /api/settings/env -- write API keys to .env.local
+    //
+    // Lane 1 / Wave A: this endpoint mutates `.env.local` and `process.env`.
+    // The auth perimeter above already gates it behind a bearer token, but
+    // we additionally:
+    //   - require `?confirm=true` (matches /api/brand/reset's destructive
+    //     posture; secrets-rotation deserves the same friction)
+    //   - emit `activity-new` with key NAMES only so the dashboard's audit
+    //     trail shows when API keys were touched. Values are never logged.
+    if (method === "POST" && url.pathname === "/api/settings/env") {
+      // Schema: { POSTIZ_API_KEY: "...", POSTIZ_API_BASE: "...", etc. }
+      const body = await parseBody(req, z.record(z.string(), z.string().max(512)));
+      if (!body.ok) return body.res;
+
+      // Validate all keys and values
+      for (const [k, v] of Object.entries(body.data)) {
+        // Keys: uppercase + underscore only (env var convention)
+        if (!/^[A-Z][A-Z0-9_]*$/.test(k)) {
+          return err(`Invalid env var key: ${k}`, 400, corsHeaders);
+        }
+        const ctrlCheck = rejectControlChars(v, `value for ${k}`);
+        if (!ctrlCheck.ok) return err(ctrlCheck.message, 400, corsHeaders);
+        if (v.includes("\n") || v.includes("\r")) {
+          return err(`Value for ${k} may not contain line breaks`, 400, corsHeaders);
+        }
+      }
+
+      if (isDryRun(url)) return json({ ok: true, dryRun: true, keys: Object.keys(body.data) }, 200, corsHeaders);
+
+      const confirm = url.searchParams.get("confirm") === "true";
+      if (!confirm) {
+        return errResponse(
+          "CONFIRM_REQUIRED",
+          "Writing API keys requires explicit confirmation",
+          400,
+          "Add ?confirm=true to the URL. The studio's audit trail will record the key names (never values).",
+          corsHeaders,
+        );
+      }
+
+      // Read existing .env.local
+      const envPath = join(STUDIO_CWD, ".env.local");
+      const existing: string[] = existsSync(envPath)
+        ? readFileSync(envPath, "utf-8").split("\n")
+        : [];
+
+      // Upsert each key
+      for (const [k, v] of Object.entries(body.data)) {
+        const line = `${k}=${JSON.stringify(v)}`;
+        const idx = existing.findIndex((l) => l.startsWith(`${k}=`));
+        if (idx >= 0) {
+          existing[idx] = line;
+        } else {
+          existing.push(line);
+        }
+      }
+
+      const nextEnv = existing.filter((l) => l !== "").join("\n") + "\n";
+      const tempEnvPath = `${envPath}.tmp-${process.pid}-${Date.now()}`;
+      try {
+        writeFileSync(tempEnvPath, nextEnv, { encoding: "utf-8", mode: 0o600 });
+        chmodSync(tempEnvPath, 0o600);
+        renameSync(tempEnvPath, envPath);
+        chmodSync(envPath, 0o600);
+      } catch {
+        return err("Could not persist .env.local", 500, corsHeaders);
+      } finally {
+        rmSync(tempEnvPath, { force: true });
+      }
+      for (const [k, v] of Object.entries(body.data)) process.env[k] = v;
+
+      // Audit trail: log the key names (no values) to the activity feed so
+      // the user sees in real time what was rotated. Failure to insert MUST
+      // NOT block the actual env write -- the file is already on disk.
+      const keyNames = Object.keys(body.data).sort();
+      try {
+        const summary = `Env keys updated: ${keyNames.join(", ")}`;
+        const row = execute(
+          `INSERT INTO activity (kind, summary, files_changed, meta)
+           VALUES ('audit', ?, ?, ?)`,
+          [
+            summary,
+            JSON.stringify([".env.local"]),
+            JSON.stringify({ source: "settings/env", keys: keyNames }),
+          ],
+        );
+        globalEmitter.publish("*", {
+          type: "activity-new",
+          payload: {
+            id: Number(row.lastInsertRowid),
+            kind: "audit" as const,
+            skill: null,
+            summary,
+            detail: null,
+            filesChanged: [".env.local"],
+            meta: { source: "settings/env", keys: keyNames },
+            createdAt: new Date().toISOString(),
+          },
+        });
+      } catch {
+        // Audit trail is best-effort; the env write already succeeded.
+      }
+
+      return json({ ok: true, written: keyNames }, 200, corsHeaders);
+    }
+
+    // POST /api/onboarding/foundation — brand-file initialization runner.
+    // Tracks 3 file lanes via lib/foundation.ts; each emits foundation:progress
+    // and the runner emits foundation:complete on the global SSE channel.
+    if (method === "POST" && url.pathname === "/api/onboarding/foundation") {
+      const body = await parseBody(req, FOUNDATION_BODY);
+      if (!body.ok) return body.res;
+
+      if (isDryRun(url)) return json({ ok: true, dryRun: true }, 200, corsHeaders);
+
+      const result = startFoundation({ from: body.data.from, seed: body.data.seed }, STUDIO_CWD);
+      return json(
+        {
+          ok: true,
+          data: {
+            jobIds: result.jobIds,
+            lanes: FOUNDATION_LANES,
+            note: body.data.from
+              ? "Scraping project URL via mktg init; subscribe to /api/events for foundation:* events"
+              : "Seeding brand templates; run /cmo for full per-skill research",
+          },
+        },
+        202,
+        corsHeaders,
+      );
+    }
+
+    // POST /api/brand/refresh — same plumbing as foundation; entry from
+    // Settings tab "Refresh research" button.
+    if (method === "POST" && url.pathname === "/api/brand/refresh") {
+      const body = await parseBody(req, FOUNDATION_BODY);
+      if (!body.ok) return body.res;
+      if (isDryRun(url)) return json({ ok: true, dryRun: true }, 200, corsHeaders);
+
+      const result = startFoundation({ from: body.data.from, seed: body.data.seed }, STUDIO_CWD);
+      return json(
+        {
+          ok: true,
+          data: {
+            jobIds: result.jobIds,
+            lanes: FOUNDATION_LANES,
+            note: "Brand-file refresh queued; subscribe to /api/events for foundation:* events",
+          },
+        },
+        202,
+        corsHeaders,
+      );
+    }
+
+    // POST /api/brand/reset?confirm=true — destructive, wipe brand/ to templates.
+    if (method === "POST" && url.pathname === "/api/brand/reset") {
+      const confirm = url.searchParams.get("confirm") === "true";
+      if (!confirm) {
+        return errResponse(
+          "CONFIRM_REQUIRED",
+          "This route is destructive and requires explicit confirmation",
+          400,
+          "Add ?confirm=true to the URL",
+          corsHeaders,
+        );
+      }
+      if (isDryRun(url)) return json({ ok: true, dryRun: true }, 200, corsHeaders);
+
+      // A15 / H1-110: back up brand/ BEFORE doing anything destructive.
+      // If the backup fails we refuse to proceed — the whole point of
+      // this code path is that losing months of learnings.md is not an
+      // acceptable failure mode. Users can always re-try once the
+      // backup target is writable.
+      const backup = await backupBrandDir(STUDIO_CWD);
+      if (!backup.ok) {
+        return err(
+          `Backup failed: ${backup.error}`,
+          502,
+          corsHeaders,
+          "Brand files NOT reset. Verify `.mktg/` is writable and has enough free space, then retry.",
+        );
+      }
+
+      const reset = await resetBrandDir(STUDIO_CWD);
+      if (!reset.ok) {
+        return err(
+          reset.error,
+          502,
+          corsHeaders,
+          "Brand files were backed up but could not be reset. Restore from the reported backup if needed.",
+        );
+      }
+
+      const files = reset.filesReset;
+      for (const f of files) {
+        globalEmitter.publish("*", { type: "brand-file-changed", payload: { file: f } });
+      }
+      const backupData = backup.skipped
+        ? { skipped: true as const, reason: backup.reason }
+        : {
+            skipped: false as const,
+            path: backup.backupRelativePath,
+            fileCount: backup.fileCount,
+            sizeBytes: backup.sizeBytes,
+          };
+      return json(
+        {
+          ok: true,
+          data: {
+            filesReset: files,
+            backup: backupData,
+            note: backup.skipped
+              ? "brand/ reset to templates — POST /api/brand/refresh or run /cmo to repopulate"
+              : `brand/ backed up to ${backup.backupRelativePath} then reset to templates — POST /api/brand/refresh or run /cmo to repopulate`,
+          },
+        },
+        200,
+        corsHeaders,
+      );
+    }
+
+    // GET /api/settings/env/status — per-key set/unset map. NEVER returns values.
+    if (method === "GET" && url.pathname === "/api/settings/env/status") {
+      // Base set (always reported) ∪ every env var any skill/catalog declares
+      // (skills-manifest env_vars, surfaced by `mktg status` → integrations),
+      // so new catalogs/skills (OPENSEO_*, GEMINI_API_KEY, MKTG_X_*, …) show
+      // up here without a hand-maintained list.
+      const BASE_KNOWN = [
+        "POSTIZ_API_KEY",
+        "POSTIZ_API_BASE",
+        "TYPEFULLY_API_KEY",
+        "EXA_API_KEY",
+        "FIRECRAWL_API_KEY",
+        "RESEND_API_KEY",
+      ];
+      const known = new Set<string>(BASE_KNOWN);
+      const statusResult = await mktgStatus(STUDIO_CWD);
+      if (statusResult.ok && statusResult.data.integrations) {
+        for (const key of Object.keys(statusResult.data.integrations)) known.add(key);
+      }
+      const KNOWN = Array.from(known).sort();
+      const envPath = join(STUDIO_CWD, ".env.local");
+      const fileLines = existsSync(envPath)
+        ? readFileSync(envPath, "utf-8").split("\n")
+        : [];
+      const inFile = new Set(
+        fileLines.map((l) => l.split("=")[0]?.trim()).filter((k): k is string => Boolean(k)),
+      );
+      const result = {} as Record<string, "set" | "unset">;
+      for (const key of KNOWN) {
+        result[key] = inFile.has(key) || Boolean(process.env[key]) ? "set" : "unset";
+      }
+      return json({ ok: true, data: result }, 200, corsHeaders);
+    }
+
+    // GET /api/onboarding/stream — SSE for onboarding progress
+    if (method === "GET" && url.pathname === "/api/onboarding/stream") {
+      return globalEmitter.subscribe("onboarding");
+    }
+
+    // -----------------------------------------------------------------------
+    // Publish tab — extracted to server/routes/publish.ts
+    // -----------------------------------------------------------------------
+    {
+      const publishRes = await tryPublishRoutes(method, url, req, corsHeaders, STUDIO_CWD, routeHttp);
+      if (publishRes) return publishRes;
+    }
+
+    // -----------------------------------------------------------------------
+    // Catalog — served inline via respondList (NOT wrapRoute; bare-shape exception)
+    // -----------------------------------------------------------------------
+    if (method === "GET" && url.pathname === "/api/catalog/list") {
+      const result = await mktgCatalogList();
+      if (!result.ok) return respondMktgError(result, corsHeaders);
+      return respondList(req, url, result.data.catalogs, corsHeaders);
+    }
+    if (method === "GET" && url.pathname === "/api/catalog/status") {
+      const result = await mktgCatalogStatus();
+      if (!result.ok) return respondMktgError(result, corsHeaders);
+      return respondList(req, url, result.data.catalogs, corsHeaders);
+    }
+
+    // SEO readiness — bridges `mktg seo status` for the Pulse readiness card
+    if (method === "GET" && url.pathname === "/api/seo/status") {
+      const result = await mktgSeoStatus({ cwd: STUDIO_CWD });
+      if (!result.ok) return respondMktgError(result, corsHeaders);
+      return respondObject(url, result.data, corsHeaders);
+    }
+
+    const catalogInfoMatch = url.pathname.match(/^\/api\/catalog\/info\/([a-z0-9-]+)$/);
+    if (method === "GET" && catalogInfoMatch) {
+      const name = catalogInfoMatch[1];
+      const idCheck = validateResourceId(name, "catalog");
+      if (!idCheck.ok) return err(idCheck.message, 400, corsHeaders);
+      const result = await mktgCatalogInfo(name);
+      if (!result.ok) return respondMktgError(result, corsHeaders);
+      return respondObject(url, result.data, corsHeaders);
+    }
+
+    // -----------------------------------------------------------------------
+    // 404 fallthrough — structured envelope (Agent DX axis 7)
+    // -----------------------------------------------------------------------
+    return err(
+      `No route registered for ${method} ${url.pathname}`,
+      404,
+      corsHeaders,
+      "Hit GET /api/schema for the full route list",
+    );
+  },
+
+  error(error) {
+    console.error("Unhandled error:", error.message);
+    return new Response(
+      JSON.stringify(
+        errEnv("INTERNAL", "Unhandled server error", "Check the server logs and report at github.com/MoizIbnYousaf/marketing-cli/issues"),
+      ),
+      {
+        status: 500,
+        headers: { "Content-Type": "application/json" },
+      },
+    );
+  },
+});
+
+console.log(`mktg-studio backend running on http://localhost:${PORT}`);
+console.log(`Routes: ${ROUTE_SCHEMA.length} registered`);
+console.log(`Health: http://localhost:${PORT}/api/health`);
+console.log(`Schema: http://localhost:${PORT}/api/schema`);
+console.log(`Events: http://localhost:${PORT}/api/events (SSE)`);
+
+// ---------------------------------------------------------------------------
+// Graceful shutdown
+// ---------------------------------------------------------------------------
+
+process.on("SIGINT", () => {
+  console.log("\nShutting down...");
+  stopBrandWatcher();
+  stopContentWatcher();
+  closeDb();
+  server.stop();
+  process.exit(0);
+});
+
+process.on("SIGTERM", () => {
+  stopBrandWatcher();
+  stopContentWatcher();
+  closeDb();
+  server.stop();
+  process.exit(0);
+});

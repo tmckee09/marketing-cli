@@ -1,0 +1,315 @@
+"use client"
+
+import { useState, useCallback, useEffect } from "react"
+import { usePathname, useRouter, useSearchParams } from "next/navigation"
+import dynamic from "next/dynamic"
+import { Activity as ActivityIcon } from "lucide-react"
+import {
+  Sheet,
+  SheetContent,
+  SheetTitle,
+  SheetDescription,
+} from "@/components/ui/sheet"
+import { WorkspaceTabs, type WorkspaceTab } from "./workspace-tabs"
+import { MobileTabDock } from "./mobile-tab-dock"
+import { useSignalStats } from "@/lib/hooks/use-signal-stats"
+import {
+  useWorkspaceStore,
+  type WorkspacePlatformFilter,
+  type WorkspaceStreamFilter,
+  type WorkspaceTimeWindow,
+} from "@/lib/stores/workspace"
+import { ActivityPanel } from "./activity-panel/activity-panel"
+import { PageTitle } from "@/components/ui/page-title"
+import { Skeleton } from "@/components/ui/skeleton"
+import { Button } from "@/components/ui/button"
+import { Tabs, TabsContent } from "@/components/ui/tabs"
+import { useIsMobile, useMediaQuery } from "@/hooks/use-mobile"
+import { cn } from "@/lib/utils"
+
+// Each tab carries 100-300 kB of its own client JS (charts, swr fan-out,
+// tab-specific composer/editor primitives). Eagerly importing all four
+// forces every dashboard load to ship the union. Lazy via next/dynamic
+// makes the active tab the only one in the first paint; switching tabs
+// pays the next chunk's download once. Suspense fallback uses the shared
+// Skeleton primitive so the flash is on-brand instead of empty.
+function TabSkeleton() {
+  return (
+    <div className="flex h-full flex-col gap-4 p-6">
+      <Skeleton className="h-8 w-48" />
+      <div className="grid grid-cols-2 gap-3 md:grid-cols-3 lg:grid-cols-4">
+        <Skeleton className="h-32 w-full" />
+        <Skeleton className="h-32 w-full" />
+        <Skeleton className="h-32 w-full" />
+        <Skeleton className="h-32 w-full" />
+      </div>
+      <Skeleton className="h-48 w-full" />
+    </div>
+  )
+}
+
+const PulsePage = dynamic(
+  () => import("./pulse/pulse-page").then((m) => ({ default: m.PulsePage })),
+  { loading: () => <TabSkeleton /> },
+)
+const ContentTab = dynamic(
+  () => import("./content/content-tab").then((m) => ({ default: m.ContentTab })),
+  { loading: () => <TabSkeleton /> },
+)
+const PublishTab = dynamic(
+  () => import("./publish/publish-tab").then((m) => ({ default: m.PublishTab })),
+  { loading: () => <TabSkeleton /> },
+)
+const BrandTab = dynamic(
+  () => import("./brand/brand-tab").then((m) => ({ default: m.BrandTab })),
+  { loading: () => <TabSkeleton /> },
+)
+
+// Accessible names for the <h1> we render per tab. These are screen-reader
+// targets -- the visible tab headings are in WorkspaceTabs / MobileTabDock,
+// which carry their own labels. Keeping this as the canonical source so
+// `<PageTitle srOnly>` + the browser's page title ladder stay in sync.
+const TAB_TITLES: Record<WorkspaceTab, string> = {
+  pulse: "Pulse",
+  signals: "Signals",
+  publish: "Publish",
+  brand: "Brand files",
+}
+
+const VALID_TABS: Set<string> = new Set(["pulse", "signals", "publish", "brand"])
+const VALID_PLATFORM_FILTERS: Set<string> = new Set(["all", "news", "instagram", "tiktok", "google_trends"])
+const VALID_STREAM_FILTERS: Set<string> = new Set(["all", "hashtag", "trending", "explore"])
+const VALID_TIME_WINDOWS: Set<string> = new Set(["live_2h", "rising_8h", "context_24h", "all"])
+
+// Tiny defensive guard for unknown values. The dashboard route handler in
+// app/(dashboard)/dashboard/page.tsx server-redirects every legacy alias
+// (hq, content, trends, audience, opportunities) before the page renders,
+// so this only catches unexpected input from random URL bar typing.
+function normalizeTab(value: string | null): WorkspaceTab {
+  if (value && VALID_TABS.has(value)) return value as WorkspaceTab
+  return "pulse"
+}
+
+function normalizePlatform(value: string | null): WorkspacePlatformFilter {
+  if (!value || !VALID_PLATFORM_FILTERS.has(value)) return "all"
+  return value as WorkspacePlatformFilter
+}
+
+function normalizeStream(value: string | null): WorkspaceStreamFilter {
+  if (!value || !VALID_STREAM_FILTERS.has(value)) return "all"
+  return value as WorkspaceStreamFilter
+}
+
+function normalizeTimeWindow(value: string | null): WorkspaceTimeWindow {
+  if (!value || !VALID_TIME_WINDOWS.has(value)) return "rising_8h"
+  return value as WorkspaceTimeWindow
+}
+
+
+export function BrandWorkspace({ groupId }: { groupId: string }) {
+  const router = useRouter()
+  const pathname = usePathname()
+  const searchParams = useSearchParams()
+  const setWorkspaceTab = useWorkspaceStore((s) => s.setWorkspaceTab)
+  const setSignalFilters = useWorkspaceStore((s) => s.setSignalFilters)
+  const [activityOpen, setActivityOpen] = useState(false)
+  const isMobile = useIsMobile()
+  const isActivityDocked = useMediaQuery("(min-width: 1280px)")
+
+  const signalStats = useSignalStats()
+
+  // Use a stable string dep -- useSearchParams() can return new object refs per
+  // render in dev/Turbopack, which would re-fire these effects every paint.
+  const search = searchParams.toString()
+  const rawTab = searchParams.get("tab")
+  const routeTab = normalizeTab(searchParams.get("tab"))
+  const routePlatform = normalizePlatform(searchParams.get("platform"))
+  const routeStreamRaw = normalizeStream(searchParams.get("stream"))
+  const routeStream =
+    routePlatform !== "all" && routePlatform !== "tiktok"
+      ? "all"
+      : routeStreamRaw
+  const routeTimeWindow = normalizeTimeWindow(searchParams.get("time"))
+
+  const activeTab = routeTab
+  const updateUrlState = useCallback((update: {
+    tab?: WorkspaceTab
+    platform?: WorkspacePlatformFilter
+    stream?: WorkspaceStreamFilter
+    timeWindow?: WorkspaceTimeWindow
+  }) => {
+    const nextParams = new URLSearchParams(search)
+    const nextTab = update.tab ?? routeTab
+    const nextPlatform = update.platform ?? routePlatform
+    const nextStreamRaw = update.stream ?? routeStream
+    const nextStream =
+      nextPlatform !== "all" && nextPlatform !== "tiktok"
+        ? "all"
+        : nextStreamRaw
+    const nextTimeWindow = update.timeWindow ?? routeTimeWindow
+
+    if (nextTab === "pulse") nextParams.delete("tab")
+    else nextParams.set("tab", nextTab)
+
+    nextParams.delete("mode")
+
+    if (nextPlatform === "all") nextParams.delete("platform")
+    else nextParams.set("platform", nextPlatform)
+
+    if (nextStream === "all") nextParams.delete("stream")
+    else nextParams.set("stream", nextStream)
+
+    if (nextTimeWindow === "rising_8h") nextParams.delete("time")
+    else nextParams.set("time", nextTimeWindow)
+
+    const nextQuery = nextParams.toString()
+    const nextHref = nextQuery ? `${pathname}?${nextQuery}` : pathname
+    router.replace(nextHref, { scroll: false })
+  }, [pathname, routePlatform, routeStream, routeTab, routeTimeWindow, router, search])
+
+  const handleTabChange = useCallback((tab: WorkspaceTab) => {
+    setWorkspaceTab(tab)
+    updateUrlState({ tab })
+  }, [setWorkspaceTab, updateUrlState])
+
+  useEffect(() => {
+    setWorkspaceTab(routeTab)
+    setSignalFilters({
+      platform: routePlatform,
+      stream: routeStream,
+      timeWindow: routeTimeWindow,
+    })
+  }, [routePlatform, routeStream, routeTab, routeTimeWindow, setSignalFilters, setWorkspaceTab])
+
+  useEffect(() => {
+    if (!rawTab) return
+    if (rawTab === routeTab) return
+    updateUrlState({ tab: routeTab })
+  }, [rawTab, routeTab, updateUrlState])
+
+  const workspaceTitleId = "workspace-active-tab-title"
+  const activitySheetOpen = activityOpen && !isActivityDocked
+
+  return (
+    // <section> + aria-labelledby instead of a second <main>: the
+    // `app/(dashboard)/layout.tsx` already mounts `<main id="dashboard-main">`
+    // as the page-level landmark (A29: avoiding nested <main>), so this
+    // region is a *named section inside* that main. Screen readers
+    // announce the section via the h1 id referenced here.
+    <section
+      aria-labelledby={workspaceTitleId}
+      className="relative flex h-full flex-col overflow-x-hidden bg-background"
+    >
+      <div className="pointer-events-none absolute inset-0 bg-[radial-gradient(1000px_420px_at_-10%_-20%,color-mix(in_srgb,var(--gradient-mint)_24%,transparent),transparent_70%),radial-gradient(820px_380px_at_110%_-20%,color-mix(in_srgb,var(--gradient-lavender)_20%,transparent),transparent_72%)]" />
+
+      {/* G5-01: every tab gets exactly one <h1>. Screen-reader-only so
+          the visible WorkspaceTabs remain the primary tab UI and we
+          don't double up on on-screen "Pulse / Signals / ..." text. */}
+      <PageTitle srOnly id={workspaceTitleId} title={TAB_TITLES[activeTab]} />
+
+      <Tabs
+        value={activeTab}
+        onValueChange={(value) => handleTabChange(value as WorkspaceTab)}
+        className="relative z-10 flex h-full min-h-0 flex-col gap-0"
+      >
+        <WorkspaceTabs
+          onActivityOpen={() => setActivityOpen(true)}
+          activityOpen={activitySheetOpen}
+          spikeCount={signalStats?.spikeCount}
+          className="hidden md:block md:border-b-0 md:px-6 md:pb-3 md:pt-0"
+        />
+
+        <div className="flex shrink-0 justify-end px-4 pb-2 pt-2 md:hidden">
+          <Button
+            variant="outline"
+            size="sm"
+            onClick={() => setActivityOpen(true)}
+            className="text-muted-foreground shadow-sm"
+            aria-label="Open /cmo activity"
+            aria-expanded={activitySheetOpen}
+            aria-controls="workspace-activity-sheet"
+          >
+            <ActivityIcon className="size-4" aria-hidden />
+            Activity
+          </Button>
+        </div>
+
+        <div className="min-h-0 flex-1 overflow-hidden">
+          {!isMobile ? (
+            <div className="h-full min-h-0 px-6 pb-5">
+              <div
+                data-demo-id="workspace-shell"
+                className="h-full min-h-0 overflow-hidden rounded-2xl border border-border bg-background/95 shadow-lg backdrop-blur"
+              >
+                <div className="grid h-full min-h-0 grid-cols-1 xl:grid-cols-[minmax(0,1fr)_clamp(320px,25vw,360px)]">
+                  <TabsContent
+                    value={activeTab}
+                    className="m-0 h-full min-h-0 overflow-hidden focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring/50"
+                  >
+                    {activeTab === "pulse" && (
+                      <div className="h-full min-h-0 overflow-auto">
+                        <PulsePage groupId={groupId} />
+                      </div>
+                    )}
+                    {activeTab === "signals" && <ContentTab />}
+                    {activeTab === "publish" && <PublishTab />}
+                    {activeTab === "brand" && <BrandTab />}
+                  </TabsContent>
+
+                  {isActivityDocked ? (
+                    <div
+                      data-demo-id="activity-rail"
+                      className="h-full min-h-0 border-l border-border bg-sidebar/80"
+                    >
+                      <ActivityPanel id="workspace-activity-rail" />
+                    </div>
+                  ) : null}
+                </div>
+              </div>
+            </div>
+          ) : (
+            <TabsContent value={activeTab} className="m-0 h-full overflow-auto pb-28">
+                {activeTab === "pulse" && <PulsePage groupId={groupId} />}
+                {activeTab === "signals" && <ContentTab />}
+                {activeTab === "publish" && <PublishTab />}
+                {activeTab === "brand" && <BrandTab />}
+            </TabsContent>
+          )}
+        </div>
+      </Tabs>
+
+      <MobileTabDock
+        activeTab={activeTab}
+        onTabChange={handleTabChange}
+        spikeCount={signalStats?.spikeCount}
+      />
+
+      <Sheet open={activitySheetOpen} onOpenChange={setActivityOpen}>
+        <SheetContent
+          id="workspace-activity-sheet"
+          side={isMobile ? "bottom" : "right"}
+          className={cn(
+            "p-0 xl:hidden",
+            isMobile
+              ? "h-[88dvh] rounded-t-3xl"
+              : "w-[min(380px,90vw)] sm:max-w-none",
+          )}
+        >
+          <div className="flex h-full flex-col pt-5">
+            <div className="border-b border-border/70 px-4 pb-3">
+              <SheetTitle className="font-serif text-lg tracking-tight">
+                /cmo Activity
+              </SheetTitle>
+              <SheetDescription>
+                Live stream of skill runs, brand writes, and publishes driven by /cmo.
+              </SheetDescription>
+            </div>
+            <div className="min-h-0 flex-1 [&>div]:!border-l-0">
+              {activitySheetOpen ? <ActivityPanel /> : null}
+            </div>
+          </div>
+        </SheetContent>
+      </Sheet>
+    </section>
+  )
+}
