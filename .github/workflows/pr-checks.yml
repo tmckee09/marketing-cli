@@ -1,0 +1,47 @@
+name: PR Checks
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  check:
+    name: Test & Type Check
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: oven-sh/setup-bun@v2
+
+      - name: Install dependencies
+        run: bun install
+
+      - name: Run tests
+        run: bun test
+
+      - name: Type check
+        run: bun x tsc --noEmit
+
+      - name: Build CLI + install mktg shim
+        # Studio server tests bridge to a real `mktg` binary on PATH
+        # (studio/lib/mktg.ts spawns `mktg <cmd> --json`). Build dist and
+        # shim it via bun against the checkout.
+        run: |
+          bun run build
+          mkdir -p "$HOME/.local/bin"
+          printf '#!/bin/sh\nexec "%s/.bun/bin/bun" "%s/src/cli.ts" "$@"\n' "$HOME" "$GITHUB_WORKSPACE" > "$HOME/.local/bin/mktg"
+          chmod +x "$HOME/.local/bin/mktg"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: Studio tests
+        run: bun run --cwd studio test
+
+      - name: Studio type check
+        run: bun run --cwd studio typecheck
+
+      - name: Studio em-dash lint
+        working-directory: studio
+        run: bun run lint:em-dash
